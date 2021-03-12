@@ -223,7 +223,7 @@ func mount(VFS *vfs.VFS, mountPath string, opt *mountlib.Options) (<-chan error,
 	case err := <-errChan:
 		err = errors.Wrap(err, "mount stopped before calling Init")
 		return nil, nil, err
-	case <-fsys.ready:
+	case <-fsys.Ready:
 	}
 
 	// Wait for the mount point to be available on Windows

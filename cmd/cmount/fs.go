@@ -26,7 +26,7 @@ const fhUnset = ^uint64(0)
 type FS struct {
 	VFS       *vfs.VFS
 	f         fs.Fs
-	ready     chan (struct{})
+	Ready     chan (struct{})
 	mu        sync.Mutex // to protect the below
 	handles   []vfs.Handle
 	destroyed int32 // read/write with sync/atomic
@@ -37,7 +37,7 @@ func NewFS(VFS *vfs.VFS) *FS {
 	fsys := &FS{
 		VFS:   VFS,
 		f:     VFS.Fs(),
-		ready: make(chan (struct{})),
+		Ready: make(chan (struct{})),
 	}
 	return fsys
 }
@@ -181,7 +181,11 @@ func (fsys *FS) stat(node vfs.Node, stat *fuse.Stat_t) (errc int) {
 // Init is called after the filesystem is ready
 func (fsys *FS) Init() {
 	defer log.Trace(fsys.f, "")("")
-	close(fsys.ready)
+	close(fsys.Ready)
+}
+
+func (fsys *FS) IsDestroyed() bool {
+	return atomic.LoadInt32(&fsys.destroyed) != 0
 }
 
 // Destroy is called when it is unmounted (note that depending on how
