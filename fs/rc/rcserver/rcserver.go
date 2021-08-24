@@ -26,7 +26,6 @@ import (
 	"github.com/skratchdot/open-golang/open"
 
 	"github.com/rclone/rclone/cmd/serve/httplib"
-	"github.com/rclone/rclone/cmd/serve/httplib/serve"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
@@ -35,6 +34,7 @@ import (
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/rc/jobs"
 	"github.com/rclone/rclone/fs/rc/rcflags"
+	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/rclone/rclone/lib/random"
 )
 
@@ -169,21 +169,9 @@ func (s *Server) Serve() error {
 // writeError writes a formatted error to the output
 func writeError(path string, in rc.Params, w http.ResponseWriter, err error, status int) {
 	fs.Errorf(nil, "rc: %q: error: %v", path, err)
-	// Adjust the error return for some well known errors
-	errOrig := errors.Cause(err)
-	switch {
-	case errOrig == fs.ErrorDirNotFound || errOrig == fs.ErrorObjectNotFound:
-		status = http.StatusNotFound
-	case rc.IsErrParamInvalid(err) || rc.IsErrParamNotFound(err):
-		status = http.StatusBadRequest
-	}
+	params, status := rc.Error(path, in, err, status)
 	w.WriteHeader(status)
-	err = rc.WriteJSON(w, rc.Params{
-		"status": status,
-		"error":  err.Error(),
-		"input":  in,
-		"path":   path,
-	})
+	err = rc.WriteJSON(w, params)
 	if err != nil {
 		// can't return the error at this point
 		fs.Errorf(nil, "rc: writeError: failed to write JSON output from %#v: %v", in, err)

@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -78,11 +77,10 @@ func init() {
 		Name:        "premiumizeme",
 		Description: "premiumize.me",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
-			err := oauthutil.Config(ctx, "premiumizeme", name, m, oauthConfig, nil)
-			if err != nil {
-				log.Fatalf("Failed to configure token: %v", err)
-			}
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+			return oauthutil.ConfigOut("", &oauthutil.Options{
+				OAuth2Config: oauthConfig,
+			})
 		},
 		Options: []fs.Option{{
 			Name: "api_key",
@@ -176,7 +174,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -370,7 +371,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		//fmt.Printf("...Error %v\n", err)
@@ -407,7 +408,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return found, errors.Wrap(err, "couldn't list files")
@@ -581,7 +582,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	var result api.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "rmdir failed")
@@ -660,7 +661,7 @@ func (f *Fs) move(ctx context.Context, isFile bool, id, oldLeaf, newLeaf, oldDir
 		var result api.Response
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(resp, err)
+			return shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
 			return errors.Wrap(err, "Move http")
@@ -769,7 +770,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "CreateDir http")
@@ -896,7 +897,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -934,7 +935,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &info)
 		if err != nil {
-			return shouldRetry(resp, err)
+			return shouldRetry(ctx, resp, err)
 		}
 		// Just check the download URL resolves - sometimes
 		// the URLs returned by premiumize.me don't resolve so
@@ -993,7 +994,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	var result api.Response
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "upload file http")
@@ -1035,7 +1036,7 @@ func (f *Fs) renameLeaf(ctx context.Context, isFile bool, id string, newLeaf str
 	var result api.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "rename http")
@@ -1060,7 +1061,7 @@ func (f *Fs) remove(ctx context.Context, id string) (err error) {
 	var result api.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "remove http")

@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,10 +51,10 @@ import (
 const (
 	rcloneClientID              = "202264815644.apps.googleusercontent.com"
 	rcloneEncryptedClientSecret = "Uj7C9jGfb9gmeaV70Lh058cNkWvepr-Es9sBm0zdgil7JaOWF1VySw"
-	timeFormatIn                = time.RFC3339
-	timeFormatOut               = "2006-01-02T15:04:05.000000000Z07:00"
-	metaMtime                   = "mtime" // key to store mtime under in metadata
-	listChunks                  = 1000    // chunk size to read directory listings
+	timeFormat                  = time.RFC3339Nano
+	metaMtime                   = "mtime"                    // key to store mtime in metadata
+	metaMtimeGsutil             = "goog-reserved-file-mtime" // key used by GSUtil to store mtime in metadata
+	listChunks                  = 1000                       // chunk size to read directory listings
 	minSleep                    = 10 * time.Millisecond
 )
 
@@ -76,17 +76,16 @@ func init() {
 		Prefix:      "gcs",
 		Description: "Google Cloud Storage (this is not Google Drive)",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			saFile, _ := m.Get("service_account_file")
 			saCreds, _ := m.Get("service_account_credentials")
 			anonymous, _ := m.Get("anonymous")
 			if saFile != "" || saCreds != "" || anonymous == "true" {
-				return
+				return nil, nil
 			}
-			err := oauthutil.Config(ctx, "google cloud storage", name, m, storageConfig, nil)
-			if err != nil {
-				log.Fatalf("Failed to configure token: %v", err)
-			}
+			return oauthutil.ConfigOut("", &oauthutil.Options{
+				OAuth2Config: storageConfig,
+			})
 		},
 		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name: "project_number",
@@ -329,7 +328,10 @@ func (f *Fs) Features() *fs.Features {
 }
 
 // shouldRetry determines whether a given err rates being retried
-func shouldRetry(err error) (again bool, errOut error) {
+func shouldRetry(ctx context.Context, err error) (again bool, errOut error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	again = false
 	if err != nil {
 		if fserrors.ShouldRetry(err) {
@@ -455,7 +457,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		encodedDirectory := f.opt.Enc.FromStandardPath(f.rootDirectory)
 		err = f.pacer.Call(func() (bool, error) {
 			_, err = f.svc.Objects.Get(f.rootBucket, encodedDirectory).Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 		if err == nil {
 			newRoot := path.Dir(f.root)
@@ -521,7 +523,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 		var objects *storage.Objects
 		err = f.pacer.Call(func() (bool, error) {
 			objects, err = list.Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 		if err != nil {
 			if gErr, ok := err.(*googleapi.Error); ok {
@@ -624,7 +626,7 @@ func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error)
 		var buckets *storage.Buckets
 		err = f.pacer.Call(func() (bool, error) {
 			buckets, err = listBuckets.Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 		if err != nil {
 			return nil, err
@@ -750,7 +752,7 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) (err error) {
 		// service account that only has the "Storage Object Admin" role.  See #2193 for details.
 		err = f.pacer.Call(func() (bool, error) {
 			_, err = f.svc.Objects.List(bucket).MaxResults(1).Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 		if err == nil {
 			// Bucket already exists
@@ -785,7 +787,7 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) (err error) {
 				insertBucket.PredefinedAcl(f.opt.BucketACL)
 			}
 			_, err = insertBucket.Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 	}, nil)
 }
@@ -802,7 +804,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) (err error) {
 	return f.cache.Remove(bucket, func() error {
 		return f.pacer.Call(func() (bool, error) {
 			err = f.svc.Buckets.Delete(bucket).Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 	})
 }
@@ -848,7 +850,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	for {
 		err = f.pacer.Call(func() (bool, error) {
 			rewriteResponse, err = rewriteRequest.Context(ctx).Do()
-			return shouldRetry(err)
+			return shouldRetry(ctx, err)
 		})
 		if err != nil {
 			return nil, err
@@ -919,7 +921,7 @@ func (o *Object) setMetaData(info *storage.Object) {
 	// read mtime out of metadata if available
 	mtimeString, ok := info.Metadata[metaMtime]
 	if ok {
-		modTime, err := time.Parse(timeFormatIn, mtimeString)
+		modTime, err := time.Parse(timeFormat, mtimeString)
 		if err == nil {
 			o.modTime = modTime
 			return
@@ -927,8 +929,19 @@ func (o *Object) setMetaData(info *storage.Object) {
 		fs.Debugf(o, "Failed to read mtime from metadata: %s", err)
 	}
 
+	// Fallback to GSUtil mtime
+	mtimeGsutilString, ok := info.Metadata[metaMtimeGsutil]
+	if ok {
+		unixTimeSec, err := strconv.ParseInt(mtimeGsutilString, 10, 64)
+		if err == nil {
+			o.modTime = time.Unix(unixTimeSec, 0)
+			return
+		}
+		fs.Debugf(o, "Failed to read GSUtil mtime from metadata: %s", err)
+	}
+
 	// Fallback to the Updated time
-	modTime, err := time.Parse(timeFormatIn, info.Updated)
+	modTime, err := time.Parse(timeFormat, info.Updated)
 	if err != nil {
 		fs.Logf(o, "Bad time decode: %v", err)
 	} else {
@@ -941,7 +954,7 @@ func (o *Object) readObjectInfo(ctx context.Context) (object *storage.Object, er
 	bucket, bucketPath := o.split()
 	err = o.fs.pacer.Call(func() (bool, error) {
 		object, err = o.fs.svc.Objects.Get(bucket, bucketPath).Context(ctx).Do()
-		return shouldRetry(err)
+		return shouldRetry(ctx, err)
 	})
 	if err != nil {
 		if gErr, ok := err.(*googleapi.Error); ok {
@@ -985,7 +998,8 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 // Returns metadata for an object
 func metadataFromModTime(modTime time.Time) map[string]string {
 	metadata := make(map[string]string, 1)
-	metadata[metaMtime] = modTime.Format(timeFormatOut)
+	metadata[metaMtime] = modTime.Format(timeFormat)
+	metadata[metaMtimeGsutil] = strconv.FormatInt(modTime.Unix(), 10)
 	return metadata
 }
 
@@ -997,11 +1011,11 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) (err error) 
 		return err
 	}
 	// Add the mtime to the existing metadata
-	mtime := modTime.Format(timeFormatOut)
 	if object.Metadata == nil {
 		object.Metadata = make(map[string]string, 1)
 	}
-	object.Metadata[metaMtime] = mtime
+	object.Metadata[metaMtime] = modTime.Format(timeFormat)
+	object.Metadata[metaMtimeGsutil] = strconv.FormatInt(modTime.Unix(), 10)
 	// Copy the object to itself to update the metadata
 	// Using PATCH requires too many permissions
 	bucket, bucketPath := o.split()
@@ -1012,7 +1026,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) (err error) 
 			copyObject.DestinationPredefinedAcl(o.fs.opt.ObjectACL)
 		}
 		newObject, err = copyObject.Context(ctx).Do()
-		return shouldRetry(err)
+		return shouldRetry(ctx, err)
 	})
 	if err != nil {
 		return err
@@ -1043,7 +1057,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 				_ = res.Body.Close() // ignore error
 			}
 		}
-		return shouldRetry(err)
+		return shouldRetry(ctx, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1109,7 +1123,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			insertObject.PredefinedAcl(o.fs.opt.ObjectACL)
 		}
 		newObject, err = insertObject.Context(ctx).Do()
-		return shouldRetry(err)
+		return shouldRetry(ctx, err)
 	})
 	if err != nil {
 		return err
@@ -1124,7 +1138,7 @@ func (o *Object) Remove(ctx context.Context) (err error) {
 	bucket, bucketPath := o.split()
 	err = o.fs.pacer.Call(func() (bool, error) {
 		err = o.fs.svc.Objects.Delete(bucket, bucketPath).Context(ctx).Do()
-		return shouldRetry(err)
+		return shouldRetry(ctx, err)
 	})
 	return err
 }

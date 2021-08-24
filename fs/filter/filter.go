@@ -373,8 +373,8 @@ func (f *Filter) InActive() bool {
 		len(f.Opt.ExcludeFile) == 0)
 }
 
-// includeRemote returns whether this remote passes the filter rules.
-func (f *Filter) includeRemote(remote string) bool {
+// IncludeRemote returns whether this remote passes the filter rules.
+func (f *Filter) IncludeRemote(remote string) bool {
 	for _, rule := range f.fileRules.rules {
 		if rule.Match(remote) {
 			return rule.Include
@@ -467,7 +467,7 @@ func (f *Filter) Include(remote string, size int64, modTime time.Time) bool {
 	if f.Opt.MaxSize >= 0 && size > int64(f.Opt.MaxSize) {
 		return false
 	}
-	return f.includeRemote(remote)
+	return f.IncludeRemote(remote)
 }
 
 // IncludeObject returns whether this object should be included into
@@ -613,6 +613,19 @@ func GetConfig(ctx context.Context) *Filter {
 		return globalConfig
 	}
 	return c.(*Filter)
+}
+
+// CopyConfig copies the global config (if any) from srcCtx into
+// dstCtx returning the new context.
+func CopyConfig(dstCtx, srcCtx context.Context) context.Context {
+	if srcCtx == nil {
+		return dstCtx
+	}
+	c := srcCtx.Value(configContextKey)
+	if c == nil {
+		return dstCtx
+	}
+	return context.WithValue(dstCtx, configContextKey, c)
 }
 
 // AddConfig returns a mutable config structure based on a shallow

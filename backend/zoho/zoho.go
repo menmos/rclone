@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -36,8 +35,8 @@ import (
 )
 
 const (
-	rcloneClientID              = "1000.OZNFWW075EKDSIE1R42HI9I2SUPC9A"
-	rcloneEncryptedClientSecret = "rn7myzbsYK3WlqO2EU6jU8wmj0ylsx7_1B5wvSaVncYbu1Wt0QxPW9FFbidjqAZtyxnBenYIWq1pcA"
+	rcloneClientID              = "1000.46MXF275FM2XV7QCHX5A7K3LGME66B"
+	rcloneEncryptedClientSecret = "U-2gxclZQBcOG9NPhjiXAhj-f0uQ137D0zar8YyNHXHkQZlTeSpIOQfmCb4oSpvosJp_SJLXmLLeUA"
 	minSleep                    = 10 * time.Millisecond
 	maxSleep                    = 2 * time.Second
 	decayConstant               = 2 // bigger for slower decay, exponential
@@ -73,36 +72,97 @@ func init() {
 		Name:        "zoho",
 		Description: "Zoho",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			// Need to setup region before configuring oauth
-			setupRegion(m)
-			opt := oauthutil.Options{
-				// No refresh token unless ApprovalForce is set
-				OAuth2Opts: []oauth2.AuthCodeOption{oauth2.ApprovalForce},
-			}
-			if err := oauthutil.Config(ctx, "zoho", name, m, oauthConfig, &opt); err != nil {
-				log.Fatalf("Failed to configure token: %v", err)
-			}
-			// We need to rewrite the token type to "Zoho-oauthtoken" because Zoho wants
-			// it's own custom type
-			token, err := oauthutil.GetToken(name, m)
+			err := setupRegion(m)
 			if err != nil {
-				log.Fatalf("Failed to read token: %v", err)
+				return nil, err
 			}
-			if token.TokenType != "Zoho-oauthtoken" {
-				token.TokenType = "Zoho-oauthtoken"
-				err = oauthutil.PutToken(name, m, token, false)
+			getSrvs := func() (authSrv, apiSrv *rest.Client, err error) {
+				oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 				if err != nil {
-					log.Fatalf("Failed to configure token: %v", err)
+					return nil, nil, errors.Wrap(err, "failed to load oAuthClient")
 				}
+				authSrv = rest.NewClient(oAuthClient).SetRoot(accountsURL)
+				apiSrv = rest.NewClient(oAuthClient).SetRoot(rootURL)
+				return authSrv, apiSrv, nil
 			}
-			if err = setupRoot(ctx, name, m); err != nil {
-				log.Fatalf("Failed to configure root directory: %v", err)
+
+			switch config.State {
+			case "":
+				return oauthutil.ConfigOut("teams", &oauthutil.Options{
+					OAuth2Config: oauthConfig,
+					// No refresh token unless ApprovalForce is set
+					OAuth2Opts: []oauth2.AuthCodeOption{oauth2.ApprovalForce},
+				})
+			case "teams":
+				// We need to rewrite the token type to "Zoho-oauthtoken" because Zoho wants
+				// it's own custom type
+				token, err := oauthutil.GetToken(name, m)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to read token")
+				}
+				if token.TokenType != "Zoho-oauthtoken" {
+					token.TokenType = "Zoho-oauthtoken"
+					err = oauthutil.PutToken(name, m, token, false)
+					if err != nil {
+						return nil, errors.Wrap(err, "failed to configure token")
+					}
+				}
+
+				authSrv, apiSrv, err := getSrvs()
+				if err != nil {
+					return nil, err
+				}
+
+				// Get the user Info
+				opts := rest.Opts{
+					Method: "GET",
+					Path:   "/oauth/user/info",
+				}
+				var user api.User
+				_, err = authSrv.CallJSON(ctx, &opts, nil, &user)
+				if err != nil {
+					return nil, err
+				}
+
+				// Get the teams
+				teams, err := listTeams(ctx, user.ZUID, apiSrv)
+				if err != nil {
+					return nil, err
+				}
+				return fs.ConfigChoose("workspace", "config_team_drive_id", "Team Drive ID", len(teams), func(i int) (string, string) {
+					team := teams[i]
+					return team.ID, team.Attributes.Name
+				})
+			case "workspace":
+				_, apiSrv, err := getSrvs()
+				if err != nil {
+					return nil, err
+				}
+				teamID := config.Result
+				workspaces, err := listWorkspaces(ctx, teamID, apiSrv)
+				if err != nil {
+					return nil, err
+				}
+				return fs.ConfigChoose("workspace_end", "config_workspace", "Workspace ID", len(workspaces), func(i int) (string, string) {
+					workspace := workspaces[i]
+					return workspace.ID, workspace.Attributes.Name
+				})
+			case "workspace_end":
+				worksspaceID := config.Result
+				m.Set(configRootID, worksspaceID)
+				return nil, nil
 			}
+			return nil, fmt.Errorf("unknown state %q", config.State)
 		},
 		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name: "region",
-			Help: "Zoho region to connect to. You'll have to use the region you organization is registered in.",
+			Help: `Zoho region to connect to.
+
+You'll have to use the region your organization is registered in. If
+not sure use the same top level domain as you connect to in your
+browser.`,
 			Examples: []fs.OptionExample{{
 				Value: "com",
 				Help:  "United states / Global",
@@ -159,15 +219,16 @@ type Object struct {
 
 // ------------------------------------------------------------
 
-func setupRegion(m configmap.Mapper) {
+func setupRegion(m configmap.Mapper) error {
 	region, ok := m.Get("region")
-	if !ok {
-		log.Fatalf("No region set\n")
+	if !ok || region == "" {
+		return errors.New("no region set")
 	}
 	rootURL = fmt.Sprintf("https://workdrive.zoho.%s/api/v1", region)
 	accountsURL = fmt.Sprintf("https://accounts.zoho.%s", region)
 	oauthConfig.Endpoint.AuthURL = fmt.Sprintf("https://accounts.zoho.%s/oauth/v2/auth", region)
 	oauthConfig.Endpoint.TokenURL = fmt.Sprintf("https://accounts.zoho.%s/oauth/v2/token", region)
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -200,49 +261,6 @@ func listWorkspaces(ctx context.Context, teamID string, srv *rest.Client) ([]api
 	return workspaceList.TeamWorkspace, nil
 }
 
-func setupRoot(ctx context.Context, name string, m configmap.Mapper) error {
-	oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
-	if err != nil {
-		log.Fatalf("Failed to load oAuthClient: %s", err)
-	}
-	authSrv := rest.NewClient(oAuthClient).SetRoot(accountsURL)
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/oauth/user/info",
-	}
-
-	var user api.User
-	_, err = authSrv.CallJSON(ctx, &opts, nil, &user)
-	if err != nil {
-		return err
-	}
-
-	apiSrv := rest.NewClient(oAuthClient).SetRoot(rootURL)
-	teams, err := listTeams(ctx, user.ZUID, apiSrv)
-	if err != nil {
-		return err
-	}
-	var teamIDs, teamNames []string
-	for _, team := range teams {
-		teamIDs = append(teamIDs, team.ID)
-		teamNames = append(teamNames, team.Attributes.Name)
-	}
-	teamID := config.Choose("Enter a Team Drive ID", teamIDs, teamNames, true)
-
-	workspaces, err := listWorkspaces(ctx, teamID, apiSrv)
-	if err != nil {
-		return err
-	}
-	var workspaceIDs, workspaceNames []string
-	for _, workspace := range workspaces {
-		workspaceIDs = append(workspaceIDs, workspace.ID)
-		workspaceNames = append(workspaceNames, workspace.Attributes.Name)
-	}
-	worksspaceID := config.Choose("Enter a Workspace ID", workspaceIDs, workspaceNames, true)
-	m.Set(configRootID, worksspaceID)
-	return nil
-}
-
 // --------------------------------------------------------------
 
 // retryErrorCodes is a slice of error codes that we will retry
@@ -257,7 +275,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	authRetry := false
 
 	if resp != nil && resp.StatusCode == 401 && len(resp.Header["Www-Authenticate"]) == 1 && strings.Index(resp.Header["Www-Authenticate"][0], "expired_token") >= 0 {
@@ -354,7 +375,7 @@ func (f *Fs) readMetaDataForID(ctx context.Context, id string) (*api.Item, error
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -367,6 +388,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Parse config into Options struct
 	opt := new(Options)
 	if err := configstruct.Set(m, opt); err != nil {
+		return nil, err
+	}
+	err := setupRegion(m)
+	if err != nil {
 		return nil, err
 	}
 
@@ -450,7 +475,7 @@ OUTER:
 		var resp *http.Response
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(resp, err)
+			return shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
 			return found, errors.Wrap(err, "couldn't list files")
@@ -555,7 +580,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &mkdir, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		//fmt.Printf("...Error %v\n", err)
@@ -643,7 +668,7 @@ func (f *Fs) upload(ctx context.Context, name string, parent string, size int64,
 	params.Set("filename", name)
 	params.Set("parent_id", parent)
 	params.Set("override-name-exist", strconv.FormatBool(true))
-	formReader, contentType, overhead, err := rest.MultipartUpload(in, nil, "content", name)
+	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, nil, "content", name)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to make multipart upload")
 	}
@@ -664,7 +689,7 @@ func (f *Fs) upload(ctx context.Context, name string, parent string, size int64,
 	var uploadResponse *api.UploadResponse
 	err = f.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &uploadResponse)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "upload error")
@@ -746,7 +771,7 @@ func (f *Fs) deleteObject(ctx context.Context, id string) (err error) {
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &delete, nil)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "delete object failed")
@@ -816,7 +841,7 @@ func (f *Fs) rename(ctx context.Context, id, name string) (item *api.Item, err e
 	var result *api.ItemInfo
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &rename, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "rename failed")
@@ -869,7 +894,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	var result *api.ItemList
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &copyFile, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "couldn't copy file")
@@ -914,7 +939,7 @@ func (f *Fs) move(ctx context.Context, srcID, parentID string) (item *api.Item, 
 	var result *api.ItemList
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &moveFile, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "move failed")
@@ -1181,7 +1206,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err

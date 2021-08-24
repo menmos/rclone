@@ -8,8 +8,8 @@ Configure
 
 First, you'll need to configure rclone.  As the object storage systems
 have quite complicated authentication these are kept in a config file.
-(See the `--config` entry for how to find the config file and choose
-its location.)
+(See the [`--config`](#config-config-file) entry for how to find the config
+file and choose its location.)
 
 The easiest way to make the config is to run rclone with the config
 option:
@@ -24,7 +24,6 @@ See the following for detailed instructions for
   * [Amazon S3](/s3/)
   * [Backblaze B2](/b2/)
   * [Box](/box/)
-  * [Cache](/cache/)
   * [Chunker](/chunker/) - transparently splits large files for other remotes
   * [Citrix ShareFile](/sharefile/)
   * [Compress](/compress/)
@@ -57,6 +56,7 @@ See the following for detailed instructions for
   * [SugarSync](/sugarsync/)
   * [Tardigrade](/tardigrade/)
   * [Union](/union/)
+  * [Uptobox](/uptobox/)
   * [WebDAV](/webdav/)
   * [Yandex Disk](/yandex/)
   * [Zoho WorkDrive](/zoho/)
@@ -119,7 +119,7 @@ The main rclone commands with most used first
 * [rclone mount](/commands/rclone_mount/)	- Mount the remote as a mountpoint.
 * [rclone moveto](/commands/rclone_moveto/)	- Move file or directory from source to dest.
 * [rclone obscure](/commands/rclone_obscure/)	- Obscure password for use in the rclone.conf
-* [rclone cryptcheck](/commands/rclone_cryptcheck/)	- Check the integrity of a crypted remote.
+* [rclone cryptcheck](/commands/rclone_cryptcheck/)	- Check the integrity of an encrypted remote.
 * [rclone about](/commands/rclone_about/)	- Get quota information from the remote.
 
 See the [commands index](/commands/) for the full list.
@@ -162,7 +162,7 @@ The syntax of the paths passed to the rclone command are as follows.
 This refers to the local file system.
 
 On Windows `\` may be used instead of `/` in local paths **only**,
-non local paths must use `/`. See [local filesystem](https://rclone.org/local/#windows-paths)
+non local paths must use `/`. See [local filesystem](https://rclone.org/local/#paths-on-windows)
 documentation for more about Windows-specific paths.
 
 These paths needn't start with a leading `/` - if they don't then they
@@ -207,6 +207,115 @@ To copy files and directories in `https://example.com/path/to/dir` to `/tmp/dir`
 
 To copy files and directories from `example.com` in the relative
 directory `path/to/dir` to `/tmp/dir` using sftp.
+
+### Connection strings {#connection-strings}
+
+The above examples can also be written using a connection string
+syntax, so instead of providing the arguments as command line
+parameters `--http-url https://pub.rclone.org` they are provided as
+part of the remote specification as a kind of connection string.
+
+    rclone lsd ":http,url='https://pub.rclone.org':"
+    rclone lsf ":http,url='https://example.com':path/to/dir"
+    rclone copy ":http,url='https://example.com':path/to/dir" /tmp/dir
+    rclone copy :sftp,host=example.com:path/to/dir /tmp/dir
+
+These can apply to modify existing remotes as well as create new
+remotes with the on the fly syntax. This example is equivalent to
+adding the `--drive-shared-with-me` parameter to the remote `gdrive:`.
+
+    rclone lsf "gdrive,shared_with_me:path/to/dir"
+
+The major advantage to using the connection string style syntax is
+that it only applies to the remote, not to all the remotes of that
+type of the command line. A common confusion is this attempt to copy a
+file shared on google drive to the normal drive which **does not
+work** because the `--drive-shared-with-me` flag applies to both the
+source and the destination.
+
+    rclone copy --drive-shared-with-me gdrive:shared-file.txt gdrive:
+
+However using the connection string syntax, this does work.
+
+    rclone copy "gdrive,shared_with_me:shared-file.txt" gdrive:
+
+Note that the connection string only affects the options of the immediate 
+backend. If for example gdriveCrypt is a crypt based on gdrive, then the 
+following command **will not work** as intended, because 
+`shared_with_me` is ignored by the crypt backend:
+
+    rclone copy "gdriveCrypt,shared_with_me:shared-file.txt" gdriveCrypt:
+
+The connection strings have the following syntax
+
+    remote,parameter=value,parameter2=value2:path/to/dir
+    :backend,parameter=value,parameter2=value2:path/to/dir
+
+If the `parameter` has a `:` or `,` then it must be placed in quotes `"` or
+`'`, so
+
+    remote,parameter="colon:value",parameter2="comma,value":path/to/dir
+    :backend,parameter='colon:value',parameter2='comma,value':path/to/dir
+
+If a quoted value needs to include that quote, then it should be
+doubled, so
+
+    remote,parameter="with""quote",parameter2='with''quote':path/to/dir
+
+This will make `parameter` be `with"quote` and `parameter2` be
+`with'quote`.
+
+If you leave off the `=parameter` then rclone will substitute `=true`
+which works very well with flags. For example to use s3 configured in
+the environment you could use:
+
+    rclone lsd :s3,env_auth:
+
+Which is equivalent to
+
+    rclone lsd :s3,env_auth=true:
+
+Note that on the command line you might need to surround these
+connection strings with `"` or `'` to stop the shell interpreting any
+special characters within them.
+
+If you are a shell master then you'll know which strings are OK and
+which aren't, but if you aren't sure then enclose them in `"` and use
+`'` as the inside quote. This syntax works on all OSes.
+
+    rclone copy ":http,url='https://example.com':path/to/dir" /tmp/dir
+
+On Linux/macOS some characters are still interpreted inside `"`
+strings in the shell (notably `\` and `$` and `"`) so if your strings
+contain those you can swap the roles of `"` and `'` thus. (This syntax
+does not work on Windows.)
+
+    rclone copy ':http,url="https://example.com":path/to/dir' /tmp/dir
+
+#### Connection strings, config and logging
+
+If you supply extra configuration to a backend by command line flag,
+environment variable or connection string then rclone will add a
+suffix based on the hash of the config to the name of the remote, eg
+
+    rclone -vv lsf --s3-chunk-size 20M s3:
+
+Has the log message
+
+    DEBUG : s3: detected overridden config - adding "{Srj1p}" suffix to name
+
+This is so rclone can tell the modified remote apart from the
+unmodified remote when caching the backends.
+
+This should only be noticeable in the logs.
+
+This means that on the fly backends such as
+
+    rclone -vv lsf :s3,env_auth:
+
+Will get their own names
+
+    DEBUG : :s3: detected overridden config - adding "{YTu53}" suffix to name
 
 ### Valid remote names
 
@@ -318,10 +427,10 @@ possibly signed sequence of decimal numbers, each with optional
 fraction and a unit suffix, such as "300ms", "-1.5h" or "2h45m". Valid
 time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
-Options which use SIZE use kByte by default.  However, a suffix of `b`
-for bytes, `k` for kBytes, `M` for MBytes, `G` for GBytes, `T` for
-TBytes and `P` for PBytes may be used.  These are the binary units, e.g.
-1, 2\*\*10, 2\*\*20, 2\*\*30 respectively.
+Options which use SIZE use KiByte (multiples of 1024 bytes) by default.
+However, a suffix of `B` for Byte, `K` for KiByte, `M` for MiByte,
+`G` for GiByte, `T` for TiByte and `P` for PiByte may be used. These are
+the binary units, e.g. 1, 2\*\*10, 2\*\*20, 2\*\*30 respectively.
 
 ### --backup-dir=DIR ###
 
@@ -364,23 +473,23 @@ This option controls the bandwidth limit. For example
 
     --bwlimit 10M
     
-would mean limit the upload and download bandwidth to 10 MByte/s.
+would mean limit the upload and download bandwidth to 10 MiByte/s.
 **NB** this is **bytes** per second not **bits** per second. To use a
-single limit, specify the desired bandwidth in kBytes/s, or use a
-suffix b|k|M|G. The default is `0` which means to not limit bandwidth.
+single limit, specify the desired bandwidth in KiByte/s, or use a
+suffix B|K|M|G|T|P. The default is `0` which means to not limit bandwidth.
 
 The upload and download bandwidth can be specified seperately, as
 `--bwlimit UP:DOWN`, so
 
     --bwlimit 10M:100k
 
-would mean limit the upload bandwidth to 10 MByte/s and the download
-bandwidth to 100 kByte/s. Either limit can be "off" meaning no limit, so
+would mean limit the upload bandwidth to 10 MiByte/s and the download
+bandwidth to 100 KiByte/s. Either limit can be "off" meaning no limit, so
 to just limit the upload bandwidth you would use
 
     --bwlimit 10M:off
 
-this would limit the upload bandwidth to 10MByte/s but the download
+this would limit the upload bandwidth to 10 MiByte/s but the download
 bandwidth would be unlimited.
 
 When specified as above the bandwidth limits last for the duration of
@@ -402,19 +511,19 @@ working hours could be:
 
 `--bwlimit "08:00,512k 12:00,10M 13:00,512k 18:00,30M 23:00,off"`
 
-In this example, the transfer bandwidth will be set to 512kBytes/sec
-at 8am every day. At noon, it will rise to 10MByte/s, and drop back
-to 512kBytes/sec at 1pm. At 6pm, the bandwidth limit will be set to
-30MByte/s, and at 11pm it will be completely disabled (full speed).
+In this example, the transfer bandwidth will be set to 512 KiByte/s
+at 8am every day. At noon, it will rise to 10 MiByte/s, and drop back
+to 512 KiByte/sec at 1pm. At 6pm, the bandwidth limit will be set to
+30 MiByte/s, and at 11pm it will be completely disabled (full speed).
 Anything between 11pm and 8am will remain unlimited.
 
 An example of timetable with `WEEKDAY` could be:
 
 `--bwlimit "Mon-00:00,512 Fri-23:59,10M Sat-10:00,1M Sun-20:00,off"`
 
-It means that, the transfer bandwidth will be set to 512kBytes/sec on
-Monday. It will rise to 10MByte/s before the end of Friday. At 10:00
-on Saturday it will be set to 1MByte/s. From 20:00 on Sunday it will
+It means that, the transfer bandwidth will be set to 512 KiByte/s on
+Monday. It will rise to 10 MiByte/s before the end of Friday. At 10:00
+on Saturday it will be set to 1 MiByte/s. From 20:00 on Sunday it will
 be unlimited.
 
 Timeslots without `WEEKDAY` are extended to the whole week. So this
@@ -430,10 +539,10 @@ Bandwidth limit apply to the data transfer for all backends. For most
 backends the directory listing bandwidth is also included (exceptions
 being the non HTTP backends, `ftp`, `sftp` and `tardigrade`).
 
-Note that the units are **Bytes/s**, not **Bits/s**. Typically
-connections are measured in Bits/s - to convert divide by 8. For
+Note that the units are **Byte/s**, not **bit/s**. Typically
+connections are measured in bit/s - to convert divide by 8. For
 example, let's say you have a 10 Mbit/s connection and you wish rclone
-to use half of it - 5 Mbit/s. This is 5/8 = 0.625MByte/s so you would
+to use half of it - 5 Mbit/s. This is 5/8 = 0.625 MiByte/s so you would
 use a `--bwlimit 0.625M` parameter for rclone.
 
 On Unix systems (Linux, macOS, …) the bandwidth limiter can be toggled by
@@ -454,7 +563,7 @@ change the bwlimit dynamically:
 This option controls per file bandwidth limit. For the options see the
 `--bwlimit` flag.
 
-For example use this to allow no transfers to be faster than 1MByte/s
+For example use this to allow no transfers to be faster than 1 MiByte/s
 
     --bwlimit-file 1M
 
@@ -537,22 +646,90 @@ See `--copy-dest` and `--backup-dir`.
 
 ### --config=CONFIG_FILE ###
 
-Specify the location of the rclone config file.
+Specify the location of the rclone configuration file, to override
+the default. E.g. `rclone config --config="rclone.conf"`.
 
-Normally the config file is in your home directory as a file called
-`.config/rclone/rclone.conf` (or `.rclone.conf` if created with an
-older version). If `$XDG_CONFIG_HOME` is set it will be at
-`$XDG_CONFIG_HOME/rclone/rclone.conf`.
+The exact default is a bit complex to describe, due to changes
+introduced through different versions of rclone while preserving
+backwards compatibility, but in most cases it is as simple as:
 
-If there is a file `rclone.conf` in the same directory as the rclone
-executable it will be preferred. This file must be created manually
-for Rclone to use it, it will never be created automatically.
+ - `%APPDATA%/rclone/rclone.conf` on Windows
+ - `~/.config/rclone/rclone.conf` on other
+
+The complete logic is as follows: Rclone will look for an existing
+configuration file in any of the following locations, in priority order:
+
+  1. `rclone.conf` (in program directory, where rclone executable is)
+  2. `%APPDATA%/rclone/rclone.conf` (only on Windows)
+  3. `$XDG_CONFIG_HOME/rclone/rclone.conf` (on all systems, including Windows)
+  4. `~/.config/rclone/rclone.conf` (see below for explanation of ~ symbol)
+  5. `~/.rclone.conf`
+
+If no existing configuration file is found, then a new one will be created
+in the following location:
+
+- On Windows: Location 2 listed above, except in the unlikely event
+  that `APPDATA` is not defined, then location 4 is used instead.
+- On Unix: Location 3 if `XDG_CONFIG_HOME` is defined, else location 4.
+- Fallback to location 5 (on all OS), when the rclone directory cannot be
+  created, but if also a home directory was not found then path
+  `.rclone.conf` relative to current working directory will be used as
+  a final resort.
+
+The `~` symbol in paths above represent the home directory of the current user
+on any OS, and the value is defined as following:
+
+  - On Windows: `%HOME%` if defined, else `%USERPROFILE%`, or else `%HOMEDRIVE%\%HOMEPATH%`.
+  - On Unix: `$HOME` if defined, else by looking up current user in OS-specific user database
+    (e.g. passwd file), or else use the result from shell command `cd && pwd`.
 
 If you run `rclone config file` you will see where the default
 location is for you.
 
-Use this flag to override the config location, e.g. `rclone
---config=".myconfig" .config`.
+The fact that an existing file `rclone.conf` in the same directory
+as the rclone executable is always preferred, means that it is easy
+to run in "portable" mode by downloading rclone executable to a
+writable directory and then create an empty file `rclone.conf` in the
+same directory.
+
+If the location is set to empty string `""` or path to a file
+with name `notfound`, or the os null device represented by value `NUL` on
+Windows and `/dev/null` on Unix systems, then rclone will keep the
+config file in memory only.
+
+The file format is basic [INI](https://en.wikipedia.org/wiki/INI_file#Format):
+Sections of text, led by a `[section]` header and followed by
+`key=value` entries on separate lines. In rclone each remote is
+represented by its own section, where the section name defines the
+name of the remote. Options are specified as the `key=value` entries,
+where the key is the option name without the `--backend-` prefix,
+in lowercase and with `_` instead of `-`. E.g. option `--mega-hard-delete`
+corresponds to key `hard_delete`. Only backend options can be specified.
+A special, and required, key `type` identifies the [storage system](/overview/),
+where the value is the internal lowercase name as returned by command
+`rclone help backends`. Comments are indicated by `;` or `#` at the
+beginning of a line.
+
+Example:
+
+    [megaremote]
+    type = mega
+    user = you@example.com
+    pass = PDPcQVVjVtzFY-GTdDFozqBhTdsPg3qH
+
+Note that passwords are in [obscured](/commands/rclone_obscure/)
+form. Also, many storage systems uses token-based authentication instead
+of passwords, and this requires additional steps. It is easier, and safer,
+to use the interactive command `rclone config` instead of manually
+editing the configuration file.
+
+The configuration file will typically contain login information, and
+should therefore have restricted permissions so that only the current user
+can read it. Rclone tries to ensure this when it writes the file.
+You may also choose to [encrypt](#configuration-encryption) the file.
+
+When token-based authentication are used, the configuration file
+must be writable, because rclone needs to update the tokens inside it.
 
 ### --contimeout=TIME ###
 
@@ -599,7 +776,7 @@ which feature does what.
 
 This flag can be useful for debugging and in exceptional circumstances
 (e.g. Google Drive limiting the total volume of Server Side Copies to
-100GB/day).
+100 GiB/day).
 
 ### --dscp VALUE ###
 
@@ -615,6 +792,8 @@ For example, if you configured QoS on router to handle LE properly. Running:
 rclone copy --dscp LE from:/from to:/to
 ```
 would make the priority lower than usual internet flows.
+
+This option has no effect on Windows (see [golang/go#42728](https://github.com/golang/go/issues/42728)).
 
 ### -n, --dry-run ###
 
@@ -645,6 +824,27 @@ triggering follow-on actions if data was copied, or skipping if not.
 
 NB: Enabling this option turns a usually non-fatal error into a potentially
 fatal one - please check and adjust your scripts accordingly!
+
+### --fs-cache-expire-duration=TIME
+
+When using rclone via the API rclone caches created remotes for 5
+minutes by default in the "fs cache". This means that if you do
+repeated actions on the same remote then rclone won't have to build it
+again from scratch, which makes it more efficient.
+
+This flag sets the time that the remotes are cached for. If you set it
+to `0` (or negative) then rclone won't cache the remotes at all.
+
+Note that if you use some flags, eg `--backup-dir` and if this is set
+to `0` rclone may build two remotes (one for the source or destination
+and one for the `--backup-dir` where it may have only built one
+before.
+
+### --fs-cache-expire-interval=TIME
+
+This controls how often rclone checks for cached remotes to expire.
+See the `--fs-cache-expire-duration` documentation above for more
+info. The default is 60s, set to 0 to disable expiry.
 
 ### --header ###
 
@@ -709,6 +909,10 @@ that exist on the destination, no matter the content of these files.
 While this isn't a generally recommended option, it can be useful
 in cases where your files change due to encryption. However, it cannot
 correct partial transfers in case a transfer was interrupted.
+
+When performing a `move`/`moveto` command, this flag will leave skipped
+files in the source location unchanged when a file with the same name
+exists on the destination.
 
 ### --ignore-size ###
 
@@ -855,7 +1059,7 @@ This is the maximum allowable backlog of files in a sync/copy/move
 queued for being checked or transferred.
 
 This can be set arbitrarily large.  It will only use memory when the
-queue is in use.  Note that it will use in the order of N kB of memory
+queue is in use.  Note that it will use in the order of N KiB of memory
 when the backlog is in use.
 
 Setting this large allows rclone to calculate how many files are
@@ -984,13 +1188,13 @@ size of the file. To calculate the number of download streams Rclone
 divides the size of the file by the `--multi-thread-cutoff` and rounds
 up, up to the maximum set with `--multi-thread-streams`.
 
-So if `--multi-thread-cutoff 250MB` and `--multi-thread-streams 4` are
+So if `--multi-thread-cutoff 250M` and `--multi-thread-streams 4` are
 in effect (the defaults):
 
-- 0MB..250MB files will be downloaded with 1 stream
-- 250MB..500MB files will be downloaded with 2 streams
-- 500MB..750MB files will be downloaded with 3 streams
-- 750MB+ files will be downloaded with 4 streams
+- 0..250 MiB files will be downloaded with 1 stream
+- 250..500 MiB files will be downloaded with 2 streams
+- 500..750 MiB files will be downloaded with 3 streams
+- 750+ MiB files will be downloaded with 4 streams
 
 ### --no-check-dest ###
 
@@ -1281,14 +1485,14 @@ date formatting syntax.
 
 ### --stats-unit=bits|bytes ###
 
-By default, data transfer rates will be printed in bytes/second.
+By default, data transfer rates will be printed in bytes per second.
 
-This option allows the data rate to be printed in bits/second.
+This option allows the data rate to be printed in bits per second.
 
 Data transfer volume will still be reported in bytes.
 
 The rate is reported as a binary unit, not SI unit. So 1 Mbit/s
-equals 1,048,576 bits/s and not 1,000,000 bits/s.
+equals 1,048,576 bit/s and not 1,000,000 bit/s.
 
 The default is `bytes`.
 
@@ -1617,7 +1821,7 @@ Configuration Encryption
 ------------------------
 Your configuration file contains information for logging in to 
 your cloud services. This means that you should keep your 
-`.rclone.conf` file in a secure location.
+`rclone.conf` file in a secure location.
 
 If you are in an environment where that isn't possible, you can
 add a password to your configuration. This means that you will
@@ -1723,6 +1927,21 @@ password prompts. To do that, pass the parameter
 of asking for a password if `RCLONE_CONFIG_PASS` doesn't contain
 a valid password, and `--password-command` has not been supplied.
 
+Whenever running commands that may be affected by options in a
+configuration file, rclone will look for an existing file according
+to the rules described [above](#config-config-file), and load any it
+finds. If an encrypted file is found, this includes decrypting it,
+with the possible consequence of a password prompt. When executing
+a command line that you know are not actually using anything from such
+a configuration file, you can avoid it being loaded by overriding the
+location, e.g. with one of the documented special values for
+memory-only configuration. Since only backend options can be stored
+in configuration files, this is normally unnecessary for commands
+that do not operate on backends, e.g. `genautocomplete`. However,
+it will be relevant for commands that do operate on backends in
+general, but are used without referencing a stored remote, e.g.
+listing local filesystem paths, or
+[connection strings](#connection-strings): `rclone --config="" ls .`
 
 Developer options
 -----------------
@@ -1921,14 +2140,13 @@ Or to always use the trash in drive `--drive-use-trash`, set
 The same parser is used for the options and the environment variables
 so they take exactly the same form.
 
+The options set by environment variables can be seen with the `-vv` flag, e.g. `rclone version -vv`.
+
 ### Config file ###
 
 You can set defaults for values in the config file on an individual
-remote basis.  If you want to use this feature, you will need to
-discover the name of the config items that you want.  The easiest way
-is to run through `rclone config` by hand, then look in the config
-file to see what the values are (the config file can be found by
-looking at the help for `--config` in `rclone help`).
+remote basis. The names of the config items are documented in the page
+for each backend.
 
 To find the name of the environment variable, you need to set, take
 `RCLONE_CONFIG_` + name of remote + `_` + name of config file option
@@ -1950,20 +2168,34 @@ mys3:
 Note that if you want to create a remote using environment variables
 you must create the `..._TYPE` variable as above.
 
+Note that you can only set the options of the immediate backend, 
+so RCLONE_CONFIG_MYS3CRYPT_ACCESS_KEY_ID has no effect, if myS3Crypt is 
+a crypt remote based on an S3 remote. However RCLONE_S3_ACCESS_KEY_ID will 
+set the access key of all remotes using S3, including myS3Crypt.
+
+Note also that now rclone has [connection strings](#connection-strings),
+it is probably easier to use those instead which makes the above example
+
+    rclone lsd :s3,access_key_id=XXX,secret_access_key=XXX:
+
 ### Precedence
 
 The various different methods of backend configuration are read in
 this order and the first one with a value is used.
 
-- Flag values as supplied on the command line, e.g. `--drive-use-trash`.
-- Remote specific environment vars, e.g. `RCLONE_CONFIG_MYREMOTE_USE_TRASH` (see above).
-- Backend specific environment vars, e.g. `RCLONE_DRIVE_USE_TRASH`.
-- Config file, e.g. `use_trash = false`.
-- Default values, e.g. `true` - these can't be changed.
+- Parameters in connection strings, e.g. `myRemote,skip_links:`
+- Flag values as supplied on the command line, e.g. `--skip-links`
+- Remote specific environment vars, e.g. `RCLONE_CONFIG_MYREMOTE_SKIP_LINKS` (see above).
+- Backend specific environment vars, e.g. `RCLONE_LOCAL_SKIP_LINKS`.
+- Backend generic environment vars, e.g. `RCLONE_SKIP_LINKS`.
+- Config file, e.g. `skip_links = true`.
+- Default values, e.g. `false` - these can't be changed.
 
-So if both `--drive-use-trash` is supplied on the config line and an
-environment variable `RCLONE_DRIVE_USE_TRASH` is set, the command line
+So if both `--skip-links` is supplied on the command line and an
+environment variable `RCLONE_LOCAL_SKIP_LINKS` is set, the command line
 flag will take preference.
+
+The backend configurations set by environment variables can be seen with the `-vv` flag, e.g. `rclone about myRemote: -vv`.
 
 For non backend configuration the order is as follows:
 
@@ -1977,4 +2209,7 @@ For non backend configuration the order is as follows:
 - `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` (or the lowercase versions thereof).
     - `HTTPS_PROXY` takes precedence over `HTTP_PROXY` for https requests.
     - The environment values may be either a complete URL or a "host[:port]" for, in which case the "http" scheme is assumed.
+- `USER` and `LOGNAME` values are used as fallbacks for current username. The primary method for looking up username is OS-specific: Windows API on Windows, real user ID in /etc/passwd on Unix systems. In the documentation the current username is simply referred to as `$USER`.
 - `RCLONE_CONFIG_DIR` - rclone **sets** this variable for use in config files and sub processes to point to the directory holding the config file.
+
+The options set by environment variables can be seen with the `-vv` and `--log-level=DEBUG` flags, e.g. `rclone version -vv`.

@@ -121,8 +121,8 @@ func TestCacheNew(t *testing.T) {
 	assert.Contains(t, c.fcache.Root(), filepath.Base(r.Fremote.Root()))
 	assert.Equal(t, []string(nil), itemAsString(c))
 
-	// mkdir
-	p, err := c.mkdir("potato")
+	// createItemDir
+	p, err := c.createItemDir("potato")
 	require.NoError(t, err)
 	assert.Equal(t, "potato", filepath.Base(p))
 	assert.Equal(t, []string(nil), itemAsString(c))
@@ -238,7 +238,7 @@ func TestCacheOpens(t *testing.T) {
 	}, itemAsString(c))
 }
 
-// test the open, mkdir, purge, close, purge sequence
+// test the open, createItemDir, purge, close, purge sequence
 func TestCacheOpenMkdir(t *testing.T) {
 	_, c, cleanup := newTestCache(t)
 	defer cleanup()
@@ -251,8 +251,8 @@ func TestCacheOpenMkdir(t *testing.T) {
 		`name="sub/potato" opens=1 size=0`,
 	}, itemAsString(c))
 
-	// mkdir
-	p, err := c.mkdir("sub/potato")
+	// createItemDir
+	p, err := c.createItemDir("sub/potato")
 	require.NoError(t, err)
 	assert.Equal(t, "potato", filepath.Base(p))
 	assert.Equal(t, []string{
@@ -279,7 +279,7 @@ func TestCacheOpenMkdir(t *testing.T) {
 
 	// clean the cache
 	c.purgeOld(-10 * time.Second)
-	c.purgeEmptyDirs()
+	c.purgeEmptyDirs("", true)
 
 	assert.Equal(t, []string(nil), itemAsString(c))
 
@@ -407,7 +407,7 @@ func TestCachePurgeOverQuota(t *testing.T) {
 	// Check only potato2 removed to get below quota
 	c.purgeOverQuota(10)
 	assert.Equal(t, int64(5), c.used)
-	c.purgeEmptyDirs()
+	c.purgeEmptyDirs("", true)
 
 	assert.Equal(t, []string{
 		`name="sub/dir/potato" opens=0 size=5`,
@@ -416,7 +416,7 @@ func TestCachePurgeOverQuota(t *testing.T) {
 	// Now purge everything
 	c.purgeOverQuota(1)
 	assert.Equal(t, int64(0), c.used)
-	c.purgeEmptyDirs()
+	c.purgeEmptyDirs("", true)
 
 	assert.Equal(t, []string(nil), itemAsString(c))
 
@@ -485,7 +485,7 @@ func TestCachePurgeClean(t *testing.T) {
 	// So we use purgeOverQuota here for the cleanup.
 	c.purgeOverQuota(1)
 
-	c.purgeEmptyDirs()
+	c.purgeEmptyDirs("", true)
 
 	assert.Equal(t, []string(nil), itemAsString(c))
 }

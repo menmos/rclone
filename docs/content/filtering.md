@@ -35,26 +35,26 @@ you expect. Instead use a `--filter...` flag.
 
 Rclone matching rules follow a glob style:
 
-    `*`         matches any sequence of non-separator (`/`) characters
-    `**`        matches any sequence of characters including `/` separators
-    `?`         matches any single non-separator (`/`) character
-    `[` [ `!` ] { character-range } `]`
-                character class (must be non-empty)
-    `{` pattern-list `}`
-                pattern alternatives
-    c           matches character c (c != `*`, `**`, `?`, `\`, `[`, `{`, `}`)
-    `\` c       matches character c
+    *         matches any sequence of non-separator (/) characters
+    **        matches any sequence of characters including / separators
+    ?         matches any single non-separator (/) character
+    [ [ ! ] { character-range } ]
+              character class (must be non-empty)
+    { pattern-list }
+              pattern alternatives
+    c         matches character c (c != *, **, ?, \, [, {, })
+    \c        matches reserved character c (c = *, **, ?, \, [, {, })
 
 character-range:
 
-    c           matches character c (c != `\\`, `-`, `]`)
-    `\` c       matches character c
-    lo `-` hi   matches character c for lo <= c <= hi
+    c         matches character c (c != \, -, ])
+    \c        matches reserved character c (c = \, -, ])
+    lo - hi   matches character c for lo <= c <= hi
 
 pattern-list:
 
-    pattern { `,` pattern }
-                comma-separated (without spaces) patterns
+    pattern { , pattern }
+              comma-separated (without spaces) patterns
 
 character classes (see [Go regular expression reference](https://golang.org/pkg/regexp/syntax/)) include:
 
@@ -236,6 +236,28 @@ Option `exclude-if-present` creates a directory exclude rule based
 on the presence of a file in a directory and takes precedence over
 other rclone directory filter rules.
 
+When using pattern list syntax, if a pattern item contains either
+`/` or `**`, then rclone will not able to imply a directory filter rule
+from this pattern list.
+
+E.g. for an include rule
+
+    {dir1/**,dir2/**}
+
+Rclone will match files below directories `dir1` or `dir2` only,
+but will not be able to use this filter to exclude a directory `dir3`
+from being traversed.
+
+Directory recursion optimisation may affect performance, but normally
+not the result. One exception to this is sync operations with option
+`--create-empty-src-dirs`, where any traversed empty directories will
+be created. With the pattern list example `{dir1/**,dir2/**}` above,
+this would create an empty directory `dir3` on destination (when it exists
+on source). Changing the filter to `{dir1,dir2}/**`, or splitting it into
+two include rules `--include dir1/** --include dir2/**`, will match the
+same files while also filtering directories, with the result that an empty
+directory `dir3` will no longer be created.
+
 ### `--exclude` - Exclude files matching pattern
 
 Excludes path/file names from an rclone command based on a single exclude
@@ -396,7 +418,7 @@ processed in.
 Arrange the order of filter rules with the most restrictive first and
 work down.
 
-E.g. For `filter-file.txt`:
+E.g. for `filter-file.txt`:
 
     # a sample filter rule file
     - secret*.jpg
@@ -564,17 +586,17 @@ remote or flag value. The fix then is to quote values containing spaces.
 ### `--min-size` - Don't transfer any file smaller than this
 
 Controls the minimum size file within the scope of an rclone command.
-Default units are `kBytes` but abbreviations `k`, `M`, or `G` are valid.
+Default units are `KiByte` but abbreviations `K`, `M`, `G`, `T` or `P` are valid.
 
-E.g. `rclone ls remote: --min-size 50k` lists files on `remote:` of 50kByte
+E.g. `rclone ls remote: --min-size 50k` lists files on `remote:` of 50 KiByte
 size or larger.
 
 ### `--max-size` - Don't transfer any file larger than this
 
 Controls the maximum size file within the scope of an rclone command.
-Default units are `kBytes` but abbreviations `k`, `M`, or `G` are valid.
+Default units are `KiByte` but abbreviations `K`, `M`, `G`, `T` or `P` are valid.
 
-E.g. `rclone ls remote: --max-size 1G` lists files on `remote:` of 1GByte
+E.g. `rclone ls remote: --max-size 1G` lists files on `remote:` of 1 GiByte
 size or smaller.
 
 ### `--max-age` - Don't transfer any file older than this
@@ -628,8 +650,8 @@ E.g. the scope of `rclone sync -i A: B:` can be restricted:
 
     rclone --min-size 50k --delete-excluded sync A: B:
 
-All files on `B:` which are less than 50 kBytes are deleted
-because they are excluded from the rclone sync command. 
+All files on `B:` which are less than 50 KiByte are deleted
+because they are excluded from the rclone sync command.
 
 ### `--dump filters` - dump the filters to the output
 

@@ -21,12 +21,13 @@ import (
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/atexit"
+	"github.com/rclone/rclone/lib/buildinfo"
 	"github.com/rclone/rclone/vfs"
 )
 
 func init() {
 	name := "cmount"
-	cmountOnly := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+	cmountOnly := ProvidedBy(runtime.GOOS)
 	if cmountOnly {
 		name = "mount"
 	}
@@ -35,6 +36,7 @@ func init() {
 		cmd.Aliases = append(cmd.Aliases, "cmount")
 	}
 	mountlib.AddRc("cmount", mount)
+	buildinfo.Tags = append(buildinfo.Tags, "cmount")
 }
 
 // Find the option string in the current options

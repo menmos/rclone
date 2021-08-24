@@ -29,14 +29,24 @@ var commandDefinition = &cobra.Command{
 	Use:   "version",
 	Short: `Show the version number.`,
 	Long: `
-Show the version number, the go version and the architecture.
+Show the rclone version number, the go version, the build target
+OS and architecture, the runtime OS and kernel version and bitness,
+build tags and the type of executable (static or dynamic).
 
-Eg
+For example:
 
     $ rclone version
-    rclone v1.41
-    - os/arch: linux/amd64
-    - go version: go1.10
+    rclone v1.55.0
+    - os/version: ubuntu 18.04 (64 bit)
+    - os/kernel: 4.15.0-136-generic (x86_64)
+    - os/type: linux
+    - os/arch: amd64
+    - go/version: go1.16
+    - go/linking: static
+    - go/tags: none
+
+Note: before rclone version 1.55 the os/type and os/arch lines were merged,
+      and the "go/version" line was tagged as "go version".
 
 If you supply the --check flag, then it will do an online check to
 compare your version with the latest release and the latest beta.
@@ -89,9 +99,7 @@ func GetVersion(url string) (v *semver.Version, vs string, date time.Time, err e
 		return v, vs, date, err
 	}
 	vs = strings.TrimSpace(string(bodyBytes))
-	if strings.HasPrefix(vs, "rclone ") {
-		vs = vs[7:]
-	}
+	vs = strings.TrimPrefix(vs, "rclone ")
 	vs = strings.TrimRight(vs, "β")
 	date, err = http.ParseTime(resp.Header.Get("Last-Modified"))
 	if err != nil {

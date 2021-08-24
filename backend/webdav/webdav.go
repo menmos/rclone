@@ -113,6 +113,21 @@ func init() {
 			Name:     config.ConfigEncoding,
 			Help:     configEncodingHelp,
 			Advanced: true,
+		}, {
+			Name: "headers",
+			Help: `Set HTTP headers for all transactions
+
+Use this to set additional HTTP headers for all transactions
+
+The input format is comma separated list of key,value pairs.  Standard
+[CSV encoding](https://godoc.org/encoding/csv) may be used.
+
+For example to set a Cookie use 'Cookie,name=value', or '"Cookie","name=value"'.
+
+You can set multiple headers, e.g. '"Cookie","name=value","Authorization","xxx"'.
+`,
+			Default:  fs.CommaSepList{},
+			Advanced: true,
 		}},
 	})
 }
@@ -126,6 +141,7 @@ type Options struct {
 	BearerToken        string               `config:"bearer_token"`
 	BearerTokenCommand string               `config:"bearer_token_command"`
 	Enc                encoder.MultiEncoder `config:"encoding"`
+	Headers            fs.CommaSepList      `config:"headers"`
 }
 
 // Fs represents a remote webdav
@@ -196,7 +212,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func (f *Fs) shouldRetry(resp *http.Response, err error) (bool, error) {
+func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	// If we have a bearer token command and it has expired then refresh it
 	if f.opt.BearerTokenCommand != "" && resp != nil && resp.StatusCode == 401 {
 		fs.Debugf(f, "Bearer token expired: %v", err)
@@ -270,7 +289,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, depth string)
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallXML(ctx, &opts, nil, &result)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if apiErr, ok := err.(*api.Error); ok {
 		// does not exist
@@ -356,6 +375,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
+
+	if len(opt.Headers)%2 != 0 {
+		return nil, errors.New("odd number of headers supplied")
+	}
+	fs.Debugf(nil, "found headers: %v", opt.Headers)
+
 	rootIsDir := strings.HasSuffix(root, "/")
 	root = strings.Trim(root, "/")
 
@@ -425,6 +450,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, err
 		}
 	}
+	if opt.Headers != nil {
+		f.addHeaders(opt.Headers)
+	}
 	f.srv.SetErrorHandler(errorHandler)
 	err = f.setQuirks(ctx, opt.Vendor)
 	if err != nil {
@@ -482,6 +510,15 @@ func (f *Fs) fetchBearerToken(cmd string) (string, error) {
 		return "", errors.Wrapf(err, "failed to get bearer token using %q: %s", f.opt.BearerTokenCommand, stderrString)
 	}
 	return stdoutString, nil
+}
+
+// Adds the configured headers to the request if any
+func (f *Fs) addHeaders(headers fs.CommaSepList) {
+	for i := 0; i < len(headers); i += 2 {
+		key := f.opt.Headers[i]
+		value := f.opt.Headers[i+1]
+		f.srv.SetHeader(key, value)
+	}
 }
 
 // fetch the bearer token and set it if successful
@@ -628,7 +665,7 @@ func (f *Fs) listAll(ctx context.Context, dir string, directoriesOnly bool, file
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallXML(ctx, &opts, nil, &result)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		if apiErr, ok := err.(*api.Error); ok {
@@ -800,7 +837,7 @@ func (f *Fs) _dirExists(ctx context.Context, dirPath string) (exists bool) {
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallXML(ctx, &opts, nil, &result)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	return err == nil
 }
@@ -822,7 +859,7 @@ func (f *Fs) _mkdir(ctx context.Context, dirPath string) error {
 	}
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.Call(ctx, &opts)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if apiErr, ok := err.(*api.Error); ok {
 		// Check if it already exists. The response code for this isn't
@@ -911,7 +948,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallXML(ctx, &opts, nil, nil)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "rmdir failed")
@@ -974,7 +1011,7 @@ func (f *Fs) copyOrMove(ctx context.Context, src fs.Object, remote string, metho
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "Copy call failed")
@@ -1070,7 +1107,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "DirMove MOVE call failed")
@@ -1112,7 +1149,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallXML(ctx, &opts, nil, &q)
-		return f.shouldRetry(resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "about call failed")
@@ -1240,7 +1277,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return o.fs.shouldRetry(resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1291,7 +1328,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return o.fs.shouldRetry(resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		// Give the WebDAV server a chance to get its internal state in order after the
@@ -1318,7 +1355,7 @@ func (o *Object) Remove(ctx context.Context) error {
 	}
 	return o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.Call(ctx, &opts)
-		return o.fs.shouldRetry(resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 }
 

@@ -155,7 +155,9 @@ func newSyncCopyMove(ctx context.Context, fdst, fsrc fs.Fs, deleteMode fs.Delete
 	// Input context - cancel this for graceful stop
 	s.inCtx, s.inCancel = context.WithCancel(s.ctx)
 	if s.noTraverse && s.deleteMode != fs.DeleteModeOff {
-		fs.Errorf(nil, "Ignoring --no-traverse with sync")
+		if !fi.HaveFilesFrom() {
+			fs.Errorf(nil, "Ignoring --no-traverse with sync")
+		}
 		s.noTraverse = false
 	}
 	s.trackRenamesStrategy, err = parseTrackRenamesStrategy(ci.TrackRenamesStrategy)
@@ -264,6 +266,9 @@ func (s *syncCopyMove) processError(err error) {
 			// Cancel the march and stop the pipes
 			s.inCancel()
 		}
+	} else if err == context.Canceled && s.inCtx.Err() != nil {
+		// Ignore context Canceled if we have called s.inCancel()
+		return
 	}
 	s.errorMu.Lock()
 	defer s.errorMu.Unlock()
@@ -349,6 +354,8 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 					// Delete src if no error on copy
 					if operations.SameObject(src, pair.Dst) {
 						fs.Logf(src, "Not removing source file as it is the same file as the destination")
+					} else if s.ci.IgnoreExisting {
+						fs.Debugf(src, "Not removing source file as destination file exists and --ignore-existing is set")
 					} else {
 						s.processError(operations.DeleteFile(s.ctx, src))
 					}
@@ -619,9 +626,7 @@ func (s *syncCopyMove) srcParentDirCheck(entry fs.DirEntry) {
 	if parentDir == "." {
 		parentDir = ""
 	}
-	if _, ok := s.srcEmptyDirs[parentDir]; ok {
-		delete(s.srcEmptyDirs, parentDir)
-	}
+	delete(s.srcEmptyDirs, parentDir)
 }
 
 // parseTrackRenamesStrategy turns a config string into a trackRenamesStrategy

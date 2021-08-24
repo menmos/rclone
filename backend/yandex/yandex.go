@@ -60,12 +60,10 @@ func init() {
 		Name:        "yandex",
 		Description: "Yandex Disk",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
-			err := oauthutil.Config(ctx, "yandex", name, m, oauthConfig, nil)
-			if err != nil {
-				log.Fatalf("Failed to configure token: %v", err)
-				return
-			}
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+			return oauthutil.ConfigOut("", &oauthutil.Options{
+				OAuth2Config: oauthConfig,
+			})
 		},
 		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name:     config.ConfigEncoding,
@@ -153,7 +151,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -226,7 +227,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -248,22 +249,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	token, err := oauthutil.GetToken(name, m)
 	if err != nil {
-		log.Fatalf("Couldn't read OAuth token (this should never happen).")
+		return nil, errors.Wrap(err, "couldn't read OAuth token")
 	}
 	if token.RefreshToken == "" {
-		log.Fatalf("Unable to get RefreshToken. If you are upgrading from older versions of rclone, please run `rclone config` and re-configure this backend.")
+		return nil, errors.New("unable to get RefreshToken. If you are upgrading from older versions of rclone, please run `rclone config` and re-configure this backend")
 	}
 	if token.TokenType != "OAuth" {
 		token.TokenType = "OAuth"
 		err = oauthutil.PutToken(name, m, token, false)
 		if err != nil {
-			log.Fatalf("Couldn't save OAuth token (this should never happen).")
+			return nil, errors.Wrap(err, "couldn't save OAuth token")
 		}
 		log.Printf("Automatically upgraded OAuth config.")
 	}
 	oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
-		log.Fatalf("Failed to configure Yandex: %v", err)
+		return nil, errors.Wrap(err, "failed to configure Yandex")
 	}
 
 	ci := fs.GetConfig(ctx)
@@ -468,7 +469,7 @@ func (f *Fs) CreateDir(ctx context.Context, path string) (err error) {
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		// fmt.Printf("CreateDir %q Error: %s\n", path, err.Error())
@@ -543,6 +544,9 @@ func (f *Fs) waitForJob(ctx context.Context, location string) (err error) {
 		var body []byte
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.Call(ctx, &opts)
+			if fserrors.ContextError(ctx, &err) {
+				return false, err
+			}
 			if err != nil {
 				return fserrors.ShouldRetry(err), err
 			}
@@ -585,6 +589,9 @@ func (f *Fs) delete(ctx context.Context, path string, hardDelete bool) (err erro
 	var body []byte
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
+		if fserrors.ContextError(ctx, &err) {
+			return false, err
+		}
 		if err != nil {
 			return fserrors.ShouldRetry(err), err
 		}
@@ -658,6 +665,9 @@ func (f *Fs) copyOrMove(ctx context.Context, method, src, dst string, overwrite 
 	var body []byte
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
+		if fserrors.ContextError(ctx, &err) {
+			return false, err
+		}
 		if err != nil {
 			return fserrors.ShouldRetry(err), err
 		}
@@ -810,7 +820,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if apiErr, ok := err.(*api.ErrorResponse); ok {
@@ -848,7 +858,7 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	return err
 }
@@ -865,7 +875,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -999,7 +1009,7 @@ func (o *Object) setCustomProperty(ctx context.Context, property string, value s
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, &cpr, nil)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	return err
 }
@@ -1032,7 +1042,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &dl)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -1047,7 +1057,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1071,7 +1081,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeT
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &ur)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -1089,7 +1099,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeT
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	return err

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -207,6 +208,36 @@ any given time.
 `,
 			Advanced: true,
 		}, {
+			Name:    "disable_concurrent_reads",
+			Default: false,
+			Help: `If set don't use concurrent reads
+
+Normally concurrent reads are safe to use and not using them will
+degrade performance, so this option is disabled by default.
+
+Some servers limit the amount number of times a file can be
+downloaded. Using concurrent reads can trigger this limit, so if you
+have a server which returns
+
+    Failed to copy: file does not exist
+
+Then you may need to enable this flag.
+
+If concurrent reads are disabled, the use_fstat option is ignored.
+`,
+			Advanced: true,
+		}, {
+			Name:    "disable_concurrent_writes",
+			Default: false,
+			Help: `If set don't use concurrent writes
+
+Normally rclone uses concurrent writes to upload files. This improves
+the performance greatly, especially for distant servers.
+
+This option disables concurrent writes should that be necessary.
+`,
+			Advanced: true,
+		}, {
 			Name:    "idle_timeout",
 			Default: fs.Duration(60 * time.Second),
 			Help: `Max time before closing idle connections
@@ -224,28 +255,30 @@ Set to 0 to keep connections indefinitely.
 
 // Options defines the configuration for this backend
 type Options struct {
-	Host              string      `config:"host"`
-	User              string      `config:"user"`
-	Port              string      `config:"port"`
-	Pass              string      `config:"pass"`
-	KeyPem            string      `config:"key_pem"`
-	KeyFile           string      `config:"key_file"`
-	KeyFilePass       string      `config:"key_file_pass"`
-	PubKeyFile        string      `config:"pubkey_file"`
-	KnownHostsFile    string      `config:"known_hosts_file"`
-	KeyUseAgent       bool        `config:"key_use_agent"`
-	UseInsecureCipher bool        `config:"use_insecure_cipher"`
-	DisableHashCheck  bool        `config:"disable_hashcheck"`
-	AskPassword       bool        `config:"ask_password"`
-	PathOverride      string      `config:"path_override"`
-	SetModTime        bool        `config:"set_modtime"`
-	Md5sumCommand     string      `config:"md5sum_command"`
-	Sha1sumCommand    string      `config:"sha1sum_command"`
-	SkipLinks         bool        `config:"skip_links"`
-	Subsystem         string      `config:"subsystem"`
-	ServerCommand     string      `config:"server_command"`
-	UseFstat          bool        `config:"use_fstat"`
-	IdleTimeout       fs.Duration `config:"idle_timeout"`
+	Host                    string      `config:"host"`
+	User                    string      `config:"user"`
+	Port                    string      `config:"port"`
+	Pass                    string      `config:"pass"`
+	KeyPem                  string      `config:"key_pem"`
+	KeyFile                 string      `config:"key_file"`
+	KeyFilePass             string      `config:"key_file_pass"`
+	PubKeyFile              string      `config:"pubkey_file"`
+	KnownHostsFile          string      `config:"known_hosts_file"`
+	KeyUseAgent             bool        `config:"key_use_agent"`
+	UseInsecureCipher       bool        `config:"use_insecure_cipher"`
+	DisableHashCheck        bool        `config:"disable_hashcheck"`
+	AskPassword             bool        `config:"ask_password"`
+	PathOverride            string      `config:"path_override"`
+	SetModTime              bool        `config:"set_modtime"`
+	Md5sumCommand           string      `config:"md5sum_command"`
+	Sha1sumCommand          string      `config:"sha1sum_command"`
+	SkipLinks               bool        `config:"skip_links"`
+	Subsystem               string      `config:"subsystem"`
+	ServerCommand           string      `config:"server_command"`
+	UseFstat                bool        `config:"use_fstat"`
+	DisableConcurrentReads  bool        `config:"disable_concurrent_reads"`
+	DisableConcurrentWrites bool        `config:"disable_concurrent_writes"`
+	IdleTimeout             fs.Duration `config:"idle_timeout"`
 }
 
 // Fs stores the interface to the remote SFTP files
@@ -266,6 +299,7 @@ type Fs struct {
 	drain        *time.Timer // used to drain the pool when we stop using the connections
 	pacer        *fs.Pacer   // pacer for operations
 	savedpswd    string
+	transfers    int32 // count in use references
 }
 
 // Object is a remote SFTP file that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -328,6 +362,23 @@ func (c *conn) closed() error {
 	return nil
 }
 
+// Show that we are doing an upload or download
+//
+// Call removeTransfer() when done
+func (f *Fs) addTransfer() {
+	atomic.AddInt32(&f.transfers, 1)
+}
+
+// Show the upload or download done
+func (f *Fs) removeTransfer() {
+	atomic.AddInt32(&f.transfers, -1)
+}
+
+// getTransfers shows whether there are any transfers in progress
+func (f *Fs) getTransfers() int32 {
+	return atomic.LoadInt32(&f.transfers)
+}
+
 // Open a new connection to the SFTP server.
 func (f *Fs) sftpConnection(ctx context.Context) (c *conn, err error) {
 	// Rate limit rate of new connections
@@ -373,8 +424,11 @@ func (f *Fs) newSftpClient(conn *ssh.Client, opts ...sftp.ClientOption) (*sftp.C
 		}
 	}
 	opts = opts[:len(opts):len(opts)] // make sure we don't overwrite the callers opts
-	opts = append(opts, sftp.UseFstat(f.opt.UseFstat))
-
+	opts = append(opts,
+		sftp.UseFstat(f.opt.UseFstat),
+		sftp.UseConcurrentReads(!f.opt.DisableConcurrentReads),
+		sftp.UseConcurrentWrites(!f.opt.DisableConcurrentWrites),
+	)
 	return sftp.NewClientPipe(pr, pw, opts...)
 }
 
@@ -451,6 +505,13 @@ func (f *Fs) putSftpConnection(pc **conn, err error) {
 func (f *Fs) drainPool(ctx context.Context) (err error) {
 	f.poolMu.Lock()
 	defer f.poolMu.Unlock()
+	if transfers := f.getTransfers(); transfers != 0 {
+		fs.Debugf(f, "Not closing %d unused connections as %d transfers in progress", len(f.pool), transfers)
+		if f.opt.IdleTimeout > 0 {
+			f.drain.Reset(time.Duration(f.opt.IdleTimeout)) // nudge on the pool emptying timer
+		}
+		return nil
+	}
 	if f.opt.IdleTimeout > 0 {
 		f.drain.Stop()
 	}
@@ -501,7 +562,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	if opt.KnownHostsFile != "" {
-		hostcallback, err := knownhosts.New(opt.KnownHostsFile)
+		hostcallback, err := knownhosts.New(env.ShellExpand(opt.KnownHostsFile))
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't parse known_hosts_file")
 		}
@@ -1331,18 +1392,19 @@ func (o *Object) stat(ctx context.Context) error {
 //
 // it also updates the info field
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
-	if o.fs.opt.SetModTime {
-		c, err := o.fs.getSftpConnection(ctx)
-		if err != nil {
-			return errors.Wrap(err, "SetModTime")
-		}
-		err = c.sftpClient.Chtimes(o.path(), modTime, modTime)
-		o.fs.putSftpConnection(&c, err)
-		if err != nil {
-			return errors.Wrap(err, "SetModTime failed")
-		}
+	if !o.fs.opt.SetModTime {
+		return nil
 	}
-	err := o.stat(ctx)
+	c, err := o.fs.getSftpConnection(ctx)
+	if err != nil {
+		return errors.Wrap(err, "SetModTime")
+	}
+	err = c.sftpClient.Chtimes(o.path(), modTime, modTime)
+	o.fs.putSftpConnection(&c, err)
+	if err != nil {
+		return errors.Wrap(err, "SetModTime failed")
+	}
+	err = o.stat(ctx)
 	if err != nil {
 		return errors.Wrap(err, "SetModTime stat failed")
 	}
@@ -1356,18 +1418,22 @@ func (o *Object) Storable() bool {
 
 // objectReader represents a file open for reading on the SFTP server
 type objectReader struct {
+	f          *Fs
 	sftpFile   *sftp.File
 	pipeReader *io.PipeReader
 	done       chan struct{}
 }
 
-func newObjectReader(sftpFile *sftp.File) *objectReader {
+func (f *Fs) newObjectReader(sftpFile *sftp.File) *objectReader {
 	pipeReader, pipeWriter := io.Pipe()
 	file := &objectReader{
+		f:          f,
 		sftpFile:   sftpFile,
 		pipeReader: pipeReader,
 		done:       make(chan struct{}),
 	}
+	// Show connection in use
+	f.addTransfer()
 
 	go func() {
 		// Use sftpFile.WriteTo to pump data so that it gets a
@@ -1397,6 +1463,8 @@ func (file *objectReader) Close() (err error) {
 	_ = file.pipeReader.Close()
 	// Wait for the background process to finish
 	<-file.done
+	// Show connection no longer in use
+	file.f.removeTransfer()
 	return err
 }
 
@@ -1430,12 +1498,27 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			return nil, errors.Wrap(err, "Open Seek failed")
 		}
 	}
-	in = readers.NewLimitedReadCloser(newObjectReader(sftpFile), limit)
+	in = readers.NewLimitedReadCloser(o.fs.newObjectReader(sftpFile), limit)
 	return in, nil
+}
+
+type sizeReader struct {
+	io.Reader
+	size int64
+}
+
+// Size returns the expected size of the stream
+//
+// It is used in sftpFile.ReadFrom as a hint to work out the
+// concurrency needed
+func (sr *sizeReader) Size() int64 {
+	return sr.size
 }
 
 // Update a remote sftp file using the data <in> and ModTime from <src>
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	o.fs.addTransfer() // Show transfer in progress
+	defer o.fs.removeTransfer()
 	// Clear the hash cache since we are about to update the object
 	o.md5sum = nil
 	o.sha1sum = nil
@@ -1463,7 +1546,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			fs.Debugf(src, "Removed after failed upload: %v", err)
 		}
 	}
-	_, err = file.ReadFrom(in)
+	_, err = file.ReadFrom(&sizeReader{Reader: in, size: src.Size()})
 	if err != nil {
 		remove()
 		return errors.Wrap(err, "Update ReadFrom failed")
@@ -1473,10 +1556,28 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		remove()
 		return errors.Wrap(err, "Update Close failed")
 	}
+
+	// Set the mod time - this stats the object if o.fs.opt.SetModTime == true
 	err = o.SetModTime(ctx, src.ModTime(ctx))
 	if err != nil {
 		return errors.Wrap(err, "Update SetModTime failed")
 	}
+
+	// Stat the file after the upload to read its stats back if o.fs.opt.SetModTime == false
+	if !o.fs.opt.SetModTime {
+		err = o.stat(ctx)
+		if err == fs.ErrorObjectNotFound {
+			// In the specific case of o.fs.opt.SetModTime == false
+			// if the object wasn't found then don't return an error
+			fs.Debugf(o, "Not found after upload with set_modtime=false so returning best guess")
+			o.modTime = src.ModTime(ctx)
+			o.size = src.Size()
+			o.mode = os.FileMode(0666) // regular file
+		} else if err != nil {
+			return errors.Wrap(err, "Update stat failed")
+		}
+	}
+
 	return nil
 }
 

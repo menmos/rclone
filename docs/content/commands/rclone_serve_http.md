@@ -26,7 +26,7 @@ control the stats printing.
 ## Server options
 
 Use --addr to specify which IP address and port the server should
-listen on, e.g. --addr 1.2.3.4:8000 or --addr :8080 to listen to all
+listen on, eg --addr 1.2.3.4:8000 or --addr :8080 to listen to all
 IPs.  By default it only listens on localhost.  You can use port
 :0 to let the OS choose an available port.
 
@@ -48,6 +48,17 @@ inserts leading and trailing "/" on --baseurl, so --baseurl "rclone",
 --baseurl "/rclone" and --baseurl "/rclone/" are all treated
 identically.
 
+### SSL/TLS
+
+By default this will serve over http.  If you want you can serve over
+https.  You will need to supply the --cert and --key flags.  If you
+wish to do client side certificate validation then you will need to
+supply --client-ca also.
+
+--cert should be a either a PEM encoded certificate or a concatenation
+of that with the CA certificate.  --key should be the PEM encoded
+private key and --client-ca should be the PEM encoded client
+certificate authority certificate.
 --template allows a user to specify a custom markup template for http
 and webdav serve functions.  The server exports the following markup
 to be used within the template to server pages:
@@ -92,18 +103,6 @@ The password file can be updated while rclone is running.
 
 Use --realm to set the authentication realm.
 
-### SSL/TLS
-
-By default this will serve over http.  If you want you can serve over
-https.  You will need to supply the --cert and --key flags.  If you
-wish to do client side certificate validation then you will need to
-supply --client-ca also.
-
---cert should be either a PEM encoded certificate or a concatenation
-of that with the CA certificate.  --key should be the PEM encoded
-private key and --client-ca should be the PEM encoded client
-certificate authority certificate.
-
 ## VFS - Virtual File System
 
 This command uses the VFS layer. This adapts the cloud storage objects
@@ -126,7 +125,7 @@ backend. Changes made through the mount will appear immediately or
 invalidate the cache.
 
     --dir-cache-time duration   Time to cache directory entries for. (default 5m0s)
-    --poll-interval duration    Time to wait between polling for changes.
+    --poll-interval duration    Time to wait between polling for changes. Must be smaller than dir-cache-time. Only on supported remotes. Set to 0 to disable. (default 1m0s)
 
 However, changes made directly on the cloud storage by the web
 interface or a different copy of rclone will only be picked up once
@@ -204,6 +203,13 @@ If using `--vfs-cache-max-size` note that the cache may exceed this size
 for two reasons.  Firstly because it is only checked every
 `--vfs-cache-poll-interval`.  Secondly because open files cannot be
 evicted from the cache.
+
+You **should not** run two copies of rclone using the same VFS cache
+with the same or overlapping remotes if using `--vfs-cache-mode > off`.
+This can potentially cause data corruption if you do. You can work
+around this by giving each rclone its own cache hierarchy with
+`--cache-dir`. You don't need to worry about this if the remotes in
+use don't overlap.
 
 ### --vfs-cache-mode off
 
@@ -348,6 +354,19 @@ If the flag is not provided on the command line, then its default value depends
 on the operating system where rclone runs: "true" on Windows and macOS, "false"
 otherwise. If the flag is provided without a value, then it is "true".
 
+## Alternate report of used bytes
+
+Some backends, most notably S3, do not report the amount of bytes used.
+If you need this information to be available when running `df` on the
+filesystem, then pass the flag `--vfs-used-is-size` to rclone.
+With this flag set, instead of relying on the backend to report this
+information, rclone will scan the whole remote similar to `rclone size`
+and compute the total used space itself.
+
+_WARNING._ Contrary to `rclone size`, this flag ignores filters so that the
+result is accurate. However, this is very inefficient and may cost lots of API
+calls resulting in extra charges. Use it as a last resort and only with caching.
+
 
 ```
 rclone serve http remote:path [flags]
@@ -356,7 +375,7 @@ rclone serve http remote:path [flags]
 ## Options
 
 ```
-      --addr string                            IPaddress:Port or :Port to bind server to. (default "localhost:8080")
+      --addr string                            IPaddress:Port or :Port to bind server to. (default "127.0.0.1:8080")
       --baseurl string                         Prefix for URLs - leave blank for root.
       --cert string                            SSL PEM key (concatenation of certificate and CA certificate)
       --client-ca string                       Client certificate authority to verify clients with
@@ -374,7 +393,7 @@ rclone serve http remote:path [flags]
       --pass string                            Password for authentication.
       --poll-interval duration                 Time to wait between polling for changes. Must be smaller than dir-cache-time. Only on supported remotes. Set to 0 to disable. (default 1m0s)
       --read-only                              Mount read-only.
-      --realm string                           realm for authentication (default "rclone")
+      --realm string                           realm for authentication
       --server-read-timeout duration           Timeout for server reading data (default 1h0m0s)
       --server-write-timeout duration          Timeout for server writing data (default 1h0m0s)
       --template string                        User Specified Template.
@@ -387,9 +406,10 @@ rclone serve http remote:path [flags]
       --vfs-cache-poll-interval duration       Interval to poll the cache for stale objects. (default 1m0s)
       --vfs-case-insensitive                   If a file name not found, find a case insensitive match.
       --vfs-read-ahead SizeSuffix              Extra read ahead over --buffer-size when using cache-mode full.
-      --vfs-read-chunk-size SizeSuffix         Read the source objects in chunks. (default 128M)
+      --vfs-read-chunk-size SizeSuffix         Read the source objects in chunks. (default 128Mi)
       --vfs-read-chunk-size-limit SizeSuffix   If greater than --vfs-read-chunk-size, double the chunk size after each chunk read, until the limit is reached. 'off' is unlimited. (default off)
       --vfs-read-wait duration                 Time to wait for in-sequence read before seeking. (default 20ms)
+      --vfs-used-is-size rclone size           Use the rclone size algorithm for Used size.
       --vfs-write-back duration                Time to writeback files after last use when using cache. (default 5s)
       --vfs-write-wait duration                Time to wait for in-sequence write before giving error. (default 1s)
 ```

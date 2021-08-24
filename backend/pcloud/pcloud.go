@@ -12,7 +12,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -72,7 +71,7 @@ func init() {
 		Name:        "pcloud",
 		Description: "Pcloud",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			optc := new(Options)
 			err := configstruct.Set(m, optc)
 			if err != nil {
@@ -94,14 +93,11 @@ func init() {
 				fs.Debugf(nil, "pcloud: got hostname %q", hostname)
 				return nil
 			}
-			opt := oauthutil.Options{
+			return oauthutil.ConfigOut("", &oauthutil.Options{
+				OAuth2Config: oauthConfig,
 				CheckAuth:    checkAuth,
 				StateBlankOK: true, // pCloud seems to drop the state parameter now - see #4210
-			}
-			err = oauthutil.Config(ctx, "pcloud", name, m, oauthConfig, &opt)
-			if err != nil {
-				log.Fatalf("Failed to configure token: %v", err)
-			}
+			})
 		},
 		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name:     config.ConfigEncoding,
@@ -213,7 +209,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	doRetry := false
 
 	// Check if it is an api.Error
@@ -405,7 +404,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		//fmt.Printf("...Error %v\n", err)
@@ -460,7 +459,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return found, errors.Wrap(err, "couldn't list files")
@@ -597,7 +596,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "rmdir failed")
@@ -662,7 +661,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -700,7 +699,7 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 	return f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 }
 
@@ -740,7 +739,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -787,7 +786,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -814,7 +813,7 @@ func (f *Fs) linkDir(ctx context.Context, dirID string, expire fs.Duration) (str
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return "", err
@@ -838,7 +837,7 @@ func (f *Fs) linkFile(ctx context.Context, path string, expire fs.Duration) (str
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return "", err
@@ -869,7 +868,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &q)
 		err = q.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "about failed")
@@ -889,7 +888,7 @@ func (f *Fs) Hashes() hash.Set {
 	//
 	// https://forum.rclone.org/t/pcloud-to-local-no-hashes-in-common/19440
 	if f.opt.Hostname == "eapi.pcloud.com" {
-		return hash.Set(hash.SHA1)
+		return hash.Set(hash.SHA1 | hash.SHA256)
 	}
 	return hash.Set(hash.MD5 | hash.SHA1)
 }
@@ -927,7 +926,7 @@ func (o *Object) getHashes(ctx context.Context) (err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -938,7 +937,7 @@ func (o *Object) getHashes(ctx context.Context) (err error) {
 
 // Hash returns the SHA-1 of an object returning a lowercase hex string
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
-	if t != hash.MD5 && t != hash.SHA1 {
+	if t != hash.MD5 && t != hash.SHA1 && t != hash.SHA256 {
 		return "", hash.ErrUnsupported
 	}
 	if o.md5 == "" && o.sha1 == "" {
@@ -1046,7 +1045,7 @@ func (o *Object) downloadURL(ctx context.Context) (URL string, err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return "", err
@@ -1072,7 +1071,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1134,7 +1133,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// opts.Body=0), so upload it as a multipart form POST with
 	// Content-Length set.
 	if size == 0 {
-		formReader, contentType, overhead, err := rest.MultipartUpload(in, opts.Parameters, "content", leaf)
+		formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, opts.Parameters, "content", leaf)
 		if err != nil {
 			return errors.Wrap(err, "failed to make multipart upload for 0 length file")
 		}
@@ -1151,7 +1150,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		// sometimes pcloud leaves a half complete file on
@@ -1181,7 +1180,7 @@ func (o *Object) Remove(ctx context.Context) error {
 	return o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 }
 

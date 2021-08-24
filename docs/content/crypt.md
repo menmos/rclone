@@ -3,8 +3,7 @@ title: "Crypt"
 description: "Encryption overlay remote"
 ---
 
-{{< icon "fa fa-lock" >}}Crypt
-----------------------------------------
+# {{< icon "fa fa-lock" >}}Crypt
 
 Rclone `crypt` remotes encrypt and decrypt other remotes.
 
@@ -517,6 +516,20 @@ names, or for debugging purposes.
 - Type:        bool
 - Default:     false
 
+#### --crypt-no-data-encryption
+
+Option to either encrypt file data or leave it unencrypted.
+
+- Config:      no_data_encryption
+- Env Var:     RCLONE_CRYPT_NO_DATA_ENCRYPTION
+- Type:        bool
+- Default:     false
+- Examples:
+    - "true"
+        - Don't encrypt file data, leave it unencrypted.
+    - "false"
+        - Encrypt file data.
+
 ### Backend commands
 
 Here are the commands specific to the crypt backend.
@@ -613,7 +626,7 @@ approximately 2×10⁻³² of re-using a nonce.
 
 #### Chunk
 
-Each chunk will contain 64kB of data, except for the last one which
+Each chunk will contain 64 KiB of data, except for the last one which
 may have less data. The data chunk is in standard NaCl SecretBox
 format. SecretBox uses XSalsa20 and Poly1305 to encrypt and
 authenticate messages.
@@ -639,12 +652,12 @@ This uses a 32 byte (256 bit key) key derived from the user password.
 
 49 bytes total
 
-1MB (1048576 bytes) file will encrypt to
+1 MiB (1048576 bytes) file will encrypt to
 
   * 32 bytes header
   * 16 chunks of 65568 bytes
 
-1049120 bytes total (a 0.05% overhead).  This is the overhead for big
+1049120 bytes total (a 0.05% overhead). This is the overhead for big
 files.
 
 ### Name encryption

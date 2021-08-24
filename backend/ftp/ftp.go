@@ -21,6 +21,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
@@ -31,6 +32,12 @@ import (
 
 var (
 	currentUser = env.CurrentUser()
+)
+
+const (
+	minSleep      = 10 * time.Millisecond
+	maxSleep      = 2 * time.Second
+	decayConstant = 2 // bigger for slower decay, exponential
 )
 
 // Register with Fs
@@ -105,6 +112,11 @@ Set to 0 to keep connections indefinitely.
 `,
 			Advanced: true,
 		}, {
+			Name:     "close_timeout",
+			Help:     "Maximum time to wait for a response to close.",
+			Default:  fs.Duration(60 * time.Second),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -132,6 +144,7 @@ type Options struct {
 	DisableEPSV       bool                 `config:"disable_epsv"`
 	DisableMLSD       bool                 `config:"disable_mlsd"`
 	IdleTimeout       fs.Duration          `config:"idle_timeout"`
+	CloseTimeout      fs.Duration          `config:"close_timeout"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -151,6 +164,7 @@ type Fs struct {
 	drain    *time.Timer // used to drain the pool when we stop using the connections
 	tokens   *pacer.TokenDispenser
 	tlsConf  *tls.Config
+	pacer    *fs.Pacer // pacer for FTP connections
 }
 
 // Object describes an FTP file
@@ -227,29 +241,41 @@ func (dl *debugLog) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-type dialCtx struct {
-	f   *Fs
-	ctx context.Context
-}
-
-// dial a new connection with fshttp dialer
-func (d *dialCtx) dial(network, address string) (net.Conn, error) {
-	conn, err := fshttp.NewDialer(d.ctx).Dial(network, address)
-	if err != nil {
-		return nil, err
+// shouldRetry returns a boolean as to whether this err deserve to be
+// retried.  It returns the err as a convenience
+func shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
 	}
-	if d.f.tlsConf != nil {
-		conn = tls.Client(conn, d.f.tlsConf)
+	switch errX := err.(type) {
+	case *textproto.Error:
+		switch errX.Code {
+		case ftp.StatusNotAvailable:
+			return true, err
+		}
 	}
-	return conn, err
+	return fserrors.ShouldRetry(err), err
 }
 
 // Open a new connection to the FTP server.
-func (f *Fs) ftpConnection(ctx context.Context) (*ftp.ServerConn, error) {
+func (f *Fs) ftpConnection(ctx context.Context) (c *ftp.ServerConn, err error) {
 	fs.Debugf(f, "Connecting to FTP server")
-	dCtx := dialCtx{f, ctx}
-	ftpConfig := []ftp.DialOption{ftp.DialWithDialFunc(dCtx.dial)}
-	if f.opt.ExplicitTLS {
+
+	// Make ftp library dial with fshttp dialer optionally using TLS
+	dial := func(network, address string) (conn net.Conn, err error) {
+		conn, err = fshttp.NewDialer(ctx).Dial(network, address)
+		if f.tlsConf != nil && err == nil {
+			conn = tls.Client(conn, f.tlsConf)
+		}
+		return
+	}
+	ftpConfig := []ftp.DialOption{ftp.DialWithDialFunc(dial)}
+
+	if f.opt.TLS {
+		// Our dialer takes care of TLS but ftp library also needs tlsConf
+		// as a trigger for sending PSBZ and PROT options to server.
+		ftpConfig = append(ftpConfig, ftp.DialWithTLS(f.tlsConf))
+	} else if f.opt.ExplicitTLS {
 		ftpConfig = append(ftpConfig, ftp.DialWithExplicitTLS(f.tlsConf))
 		// Initial connection needs to be cleartext for explicit TLS
 		conn, err := fshttp.NewDialer(ctx).Dial("tcp", f.dialAddr)
@@ -267,18 +293,22 @@ func (f *Fs) ftpConnection(ctx context.Context) (*ftp.ServerConn, error) {
 	if f.ci.Dump&(fs.DumpHeaders|fs.DumpBodies|fs.DumpRequests|fs.DumpResponses) != 0 {
 		ftpConfig = append(ftpConfig, ftp.DialWithDebugOutput(&debugLog{auth: f.ci.Dump&fs.DumpAuth != 0}))
 	}
-	c, err := ftp.Dial(f.dialAddr, ftpConfig...)
+	err = f.pacer.Call(func() (bool, error) {
+		c, err = ftp.Dial(f.dialAddr, ftpConfig...)
+		if err != nil {
+			return shouldRetry(ctx, err)
+		}
+		err = c.Login(f.user, f.pass)
+		if err != nil {
+			_ = c.Quit()
+			return shouldRetry(ctx, err)
+		}
+		return false, nil
+	})
 	if err != nil {
-		fs.Errorf(f, "Error while Dialing %s: %s", f.dialAddr, err)
-		return nil, errors.Wrap(err, "ftpConnection Dial")
+		err = errors.Wrapf(err, "failed to make FTP connection to %q", f.dialAddr)
 	}
-	err = c.Login(f.user, f.pass)
-	if err != nil {
-		_ = c.Quit()
-		fs.Errorf(f, "Error while Logging in into %s: %s", f.dialAddr, err)
-		return nil, errors.Wrap(err, "ftpConnection Login")
-	}
-	return c, nil
+	return c, err
 }
 
 // Get an FTP connection from the pool, or open a new one
@@ -411,6 +441,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (ff fs.Fs
 		dialAddr: dialAddr,
 		tokens:   pacer.NewTokenDispenser(opt.Concurrency),
 		tlsConf:  tlsConfig,
+		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -931,8 +962,8 @@ func (f *ftpReadCloser) Close() error {
 	go func() {
 		errchan <- f.rc.Close()
 	}()
-	// Wait for Close for up to 60 seconds
-	timer := time.NewTimer(60 * time.Second)
+	// Wait for Close for up to 60 seconds by default
+	timer := time.NewTimer(time.Duration(f.f.opt.CloseTimeout))
 	select {
 	case err = <-errchan:
 		timer.Stop()
@@ -1019,6 +1050,16 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return errors.Wrap(err, "Update")
 	}
 	err = c.Stor(o.fs.opt.Enc.FromStandardPath(path), in)
+	// Ignore error 250 here - send by some servers
+	if err != nil {
+		switch errX := err.(type) {
+		case *textproto.Error:
+			switch errX.Code {
+			case ftp.StatusRequestedFileActionOK:
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		_ = c.Quit() // toss this connection to avoid sync errors
 		remove()

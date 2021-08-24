@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -84,7 +83,7 @@ func init() {
 		Name:        "box",
 		Description: "Box",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			jsonFile, ok := m.Get("box_config_file")
 			boxSubType, boxSubTypeOk := m.Get("box_sub_type")
 			boxAccessToken, boxAccessTokenOk := m.Get("access_token")
@@ -93,15 +92,15 @@ func init() {
 			if ok && boxSubTypeOk && jsonFile != "" && boxSubType != "" {
 				err = refreshJWTToken(ctx, jsonFile, boxSubType, name, m)
 				if err != nil {
-					log.Fatalf("Failed to configure token with jwt authentication: %v", err)
+					return nil, errors.Wrap(err, "failed to configure token with jwt authentication")
 				}
 				// Else, if not using an access token, use oauth2
 			} else if boxAccessToken == "" || !boxAccessTokenOk {
-				err = oauthutil.Config(ctx, "box", name, m, oauthConfig, nil)
-				if err != nil {
-					log.Fatalf("Failed to configure token with oauth authentication: %v", err)
-				}
+				return oauthutil.ConfigOut("", &oauthutil.Options{
+					OAuth2Config: oauthConfig,
+				})
 			}
+			return nil, nil
 		},
 		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name:     "root_folder_id",
@@ -126,7 +125,7 @@ func init() {
 			}},
 		}, {
 			Name:     "upload_cutoff",
-			Help:     "Cutoff for switching to multipart upload (>= 50MB).",
+			Help:     "Cutoff for switching to multipart upload (>= 50 MiB).",
 			Default:  fs.SizeSuffix(defaultUploadCutoff),
 			Advanced: true,
 		}, {
@@ -157,15 +156,15 @@ func refreshJWTToken(ctx context.Context, jsonFile string, boxSubType string, na
 	jsonFile = env.ShellExpand(jsonFile)
 	boxConfig, err := getBoxConfig(jsonFile)
 	if err != nil {
-		log.Fatalf("Failed to configure token: %v", err)
+		return errors.Wrap(err, "get box config")
 	}
 	privateKey, err := getDecryptedPrivateKey(boxConfig)
 	if err != nil {
-		log.Fatalf("Failed to configure token: %v", err)
+		return errors.Wrap(err, "get decrypted private key")
 	}
 	claims, err := getClaims(boxConfig, boxSubType)
 	if err != nil {
-		log.Fatalf("Failed to configure token: %v", err)
+		return errors.Wrap(err, "get claims")
 	}
 	signingHeaders := getSigningHeaders(boxConfig)
 	queryParams := getQueryParams(boxConfig)
@@ -317,10 +316,13 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	authRetry := false
 
-	if resp != nil && resp.StatusCode == 401 && len(resp.Header["Www-Authenticate"]) == 1 && strings.Index(resp.Header["Www-Authenticate"][0], "expired_token") >= 0 {
+	if resp != nil && resp.StatusCode == 401 && strings.Contains(resp.Header.Get("Www-Authenticate"), "expired_token") {
 		authRetry = true
 		fs.Debugf(nil, "Should retry: %v", err)
 	}
@@ -548,7 +550,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &mkdir, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		//fmt.Printf("...Error %v\n", err)
@@ -585,7 +587,7 @@ OUTER:
 		var resp *http.Response
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(resp, err)
+			return shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
 			return found, errors.Wrap(err, "couldn't list files")
@@ -683,22 +685,80 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 	return o, leaf, directoryID, nil
 }
 
+// preUploadCheck checks to see if a file can be uploaded
+//
+// It returns "", nil if the file is good to go
+// It returns "ID", nil if the file must be updated
+func (f *Fs) preUploadCheck(ctx context.Context, leaf, directoryID string, size int64) (ID string, err error) {
+	check := api.PreUploadCheck{
+		Name: f.opt.Enc.FromStandardName(leaf),
+		Parent: api.Parent{
+			ID: directoryID,
+		},
+	}
+	if size >= 0 {
+		check.Size = &size
+	}
+	opts := rest.Opts{
+		Method: "OPTIONS",
+		Path:   "/files/content/",
+	}
+	var result api.PreUploadCheckResponse
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, &check, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok && apiErr.Code == "item_name_in_use" {
+			var conflict api.PreUploadCheckConflict
+			err = json.Unmarshal(apiErr.ContextInfo, &conflict)
+			if err != nil {
+				return "", errors.Wrap(err, "pre-upload check: JSON decode failed")
+			}
+			if conflict.Conflicts.Type != api.ItemTypeFile {
+				return "", errors.Wrap(err, "pre-upload check: can't overwrite non file with file")
+			}
+			return conflict.Conflicts.ID, nil
+		}
+		return "", errors.Wrap(err, "pre-upload check")
+	}
+	return "", nil
+}
+
 // Put the object
 //
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	existingObj, err := f.newObjectWithInfo(ctx, src.Remote(), nil)
-	switch err {
-	case nil:
-		return existingObj, existingObj.Update(ctx, in, src, options...)
-	case fs.ErrorObjectNotFound:
-		// Not found so create it
-		return f.PutUnchecked(ctx, in, src)
-	default:
+	// If directory doesn't exist, file doesn't exist so can upload
+	remote := src.Remote()
+	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, false)
+	if err != nil {
+		if err == fs.ErrorDirNotFound {
+			return f.PutUnchecked(ctx, in, src, options...)
+		}
 		return nil, err
 	}
+
+	// Preflight check the upload, which returns the ID if the
+	// object already exists
+	ID, err := f.preUploadCheck(ctx, leaf, directoryID, src.Size())
+	if err != nil {
+		return nil, err
+	}
+	if ID == "" {
+		return f.PutUnchecked(ctx, in, src, options...)
+	}
+
+	// If object exists then create a skeleton one with just id
+	o := &Object{
+		fs:     f,
+		remote: remote,
+		id:     ID,
+	}
+	return o, o.Update(ctx, in, src, options...)
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
@@ -740,7 +800,7 @@ func (f *Fs) deleteObject(ctx context.Context, id string) error {
 	}
 	return f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 }
 
@@ -767,7 +827,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "rmdir failed")
@@ -839,7 +899,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	var info *api.Item
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &copyFile, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -877,7 +937,7 @@ func (f *Fs) move(ctx context.Context, endpoint, id, leaf, directoryID string) (
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &move, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -895,7 +955,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &user)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read user info")
@@ -1008,7 +1068,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &shareLink, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	return info.SharedLink.URL, err
 }
@@ -1026,7 +1086,7 @@ func (f *Fs) deletePermanently(ctx context.Context, itemType, id string) error {
 	}
 	return f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 }
 
@@ -1048,7 +1108,7 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 		var resp *http.Response
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(resp, err)
+			return shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
 			return errors.Wrap(err, "couldn't list trash")
@@ -1182,7 +1242,7 @@ func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, 
 	var info *api.Item
 	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, &update, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	return info, err
 }
@@ -1215,7 +1275,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1225,7 +1285,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 // upload does a single non-multipart upload
 //
-// This is recommended for less than 50 MB of content
+// This is recommended for less than 50 MiB of content
 func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID string, modTime time.Time, options ...fs.OpenOption) (err error) {
 	upload := api.UploadFile{
 		Name:              o.fs.opt.Enc.FromStandardName(leaf),
@@ -1255,7 +1315,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 	}
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, &upload, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err

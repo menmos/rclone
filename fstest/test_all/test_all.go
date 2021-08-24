@@ -22,6 +22,7 @@ import (
 	"time"
 
 	_ "github.com/rclone/rclone/backend/all" // import all fs
+	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/lib/pacer"
 )
 
@@ -70,6 +71,7 @@ func main() {
 		log.Println("test_all should be run from the root of the rclone source code")
 		log.Fatal(err)
 	}
+	configfile.Install()
 
 	// Seed the random number generator
 	rand.Seed(time.Now().UTC().UnixNano())

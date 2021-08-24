@@ -54,10 +54,10 @@ const (
 	decayConstant       = 1 // bigger for slower decay, exponential
 	maxParts            = 10000
 	maxVersions         = 100 // maximum number of versions we search in --b2-versions mode
-	minChunkSize        = 5 * fs.MebiByte
-	defaultChunkSize    = 96 * fs.MebiByte
-	defaultUploadCutoff = 200 * fs.MebiByte
-	largeFileCopyCutoff = 4 * fs.GibiByte          // 5E9 is the max
+	minChunkSize        = 5 * fs.Mebi
+	defaultChunkSize    = 96 * fs.Mebi
+	defaultUploadCutoff = 200 * fs.Mebi
+	largeFileCopyCutoff = 4 * fs.Gibi              // 5E9 is the max
 	memoryPoolFlushTime = fs.Duration(time.Minute) // flush the cached buffers after this long
 	memoryPoolUseMmap   = false
 )
@@ -116,7 +116,7 @@ in the [b2 integrations checklist](https://www.backblaze.com/b2/docs/integration
 
 Files above this size will be uploaded in chunks of "--b2-chunk-size".
 
-This value should be set no larger than 4.657GiB (== 5GB).`,
+This value should be set no larger than 4.657 GiB (== 5 GB).`,
 			Default:  defaultUploadCutoff,
 			Advanced: true,
 		}, {
@@ -126,7 +126,7 @@ This value should be set no larger than 4.657GiB (== 5GB).`,
 Any files larger than this that need to be server-side copied will be
 copied in chunks of this size.
 
-The minimum is 0 and the maximum is 4.6GB.`,
+The minimum is 0 and the maximum is 4.6 GiB.`,
 			Default:  largeFileCopyCutoff,
 			Advanced: true,
 		}, {
@@ -305,7 +305,10 @@ var retryErrorCodes = []int{
 
 // shouldRetryNoAuth returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func (f *Fs) shouldRetryNoReauth(resp *http.Response, err error) (bool, error) {
+func (f *Fs) shouldRetryNoReauth(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	// For 429 or 503 errors look at the Retry-After: header and
 	// set the retry appropriately, starting with a minimum of 1
 	// second if it isn't set.
@@ -336,7 +339,7 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 		}
 		return true, err
 	}
-	return f.shouldRetryNoReauth(resp, err)
+	return f.shouldRetryNoReauth(ctx, resp, err)
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -504,7 +507,7 @@ func (f *Fs) authorizeAccount(ctx context.Context) error {
 	}
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, nil, &f.info)
-		return f.shouldRetryNoReauth(resp, err)
+		return f.shouldRetryNoReauth(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "failed to authenticate")
@@ -1350,7 +1353,7 @@ func (f *Fs) getDownloadAuthorization(ctx context.Context, bucket, remote string
 	}
 	var request = api.GetDownloadAuthorizationRequest{
 		BucketID:               bucketID,
-		FileNamePrefix:         f.opt.Enc.FromStandardPath(path.Join(f.root, remote)),
+		FileNamePrefix:         f.opt.Enc.FromStandardPath(path.Join(f.rootDirectory, remote)),
 		ValidDurationInSeconds: validDurationInSeconds,
 	}
 	var response api.GetDownloadAuthorizationResponse
@@ -1740,6 +1743,13 @@ func (o *Object) getOrHead(ctx context.Context, method string, options []fs.Open
 		SHA1:            resp.Header.Get(sha1Header),
 		ContentType:     resp.Header.Get("Content-Type"),
 		Info:            Info,
+	}
+	// When reading files from B2 via cloudflare using
+	// --b2-download-url cloudflare strips the Content-Length
+	// headers (presumably so it can inject stuff) so use the old
+	// length read from the listing.
+	if info.Size < 0 {
+		info.Size = o.size
 	}
 	return resp, info, nil
 }

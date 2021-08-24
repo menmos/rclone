@@ -485,6 +485,9 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 			break
 		}
 		// Retry if err returned a retry error
+		if fserrors.ContextError(ctx, &err) {
+			break
+		}
 		var retry bool
 		if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
 			retry = true
@@ -800,7 +803,7 @@ func SameDir(fdst, fsrc fs.Info) bool {
 }
 
 // Retry runs fn up to maxTries times if it returns a retriable error
-func Retry(o interface{}, maxTries int, fn func() error) (err error) {
+func Retry(ctx context.Context, o interface{}, maxTries int, fn func() error) (err error) {
 	for tries := 1; tries <= maxTries; tries++ {
 		// Call the function which might error
 		err = fn()
@@ -808,6 +811,9 @@ func Retry(o interface{}, maxTries int, fn func() error) (err error) {
 			break
 		}
 		// Retry if err returned a retry error
+		if fserrors.ContextError(ctx, &err) {
+			break
+		}
 		if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
 			fs.Debugf(o, "Received error: %v - low level retry %d/%d", err, tries, maxTries)
 			continue
@@ -847,7 +853,7 @@ var SyncPrintf = func(format string, a ...interface{}) {
 func syncFprintf(w io.Writer, format string, a ...interface{}) {
 	outMutex.Lock()
 	defer outMutex.Unlock()
-	if w == nil {
+	if w == nil || w == os.Stdout {
 		SyncPrintf(format, a...)
 	} else {
 		_, _ = fmt.Fprintf(w, format, a...)
@@ -1037,7 +1043,7 @@ func TryRmdir(ctx context.Context, f fs.Fs, dir string) error {
 	if SkipDestructive(ctx, fs.LogDirName(f, dir), "remove directory") {
 		return nil
 	}
-	fs.Debugf(fs.LogDirName(f, dir), "Removing directory")
+	fs.Infof(fs.LogDirName(f, dir), "Removing directory")
 	return f.Rmdir(ctx, dir)
 }
 
@@ -1402,7 +1408,9 @@ func compareDest(ctx context.Context, dst, src fs.Object, CompareDest fs.Fs) (No
 	default:
 		return false, err
 	}
-	if Equal(ctx, src, CompareDestFile) {
+	opt := defaultEqualOpt(ctx)
+	opt.updateModTime = false
+	if equal(ctx, src, CompareDestFile, opt) {
 		fs.Debugf(src, "Destination found in --compare-dest, skipping")
 		return true, nil
 	}
@@ -1629,6 +1637,7 @@ func copyURLFn(ctx context.Context, dstFileName string, url string, dstFileNameF
 		if dstFileName == "." || dstFileName == "/" {
 			return errors.Errorf("CopyURL failed: file name wasn't found in url")
 		}
+		fs.Debugf(dstFileName, "File name found in url")
 	}
 	return fn(ctx, dstFileName, resp.Body, resp.ContentLength, modTime)
 }
@@ -1742,7 +1751,7 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 	// This will move the file to a temporary name then
 	// move it back to the intended destination. This is required
 	// to avoid issues with certain remotes and avoid file deletion.
-	if !cp && fdst.Name() == fsrc.Name() && fdst.Features().CaseInsensitive && dstFileName != srcFileName && strings.ToLower(dstFilePath) == strings.ToLower(srcFilePath) {
+	if !cp && fdst.Name() == fsrc.Name() && fdst.Features().CaseInsensitive && dstFileName != srcFileName && strings.EqualFold(dstFilePath, srcFilePath) {
 		// Create random name to temporarily move file to
 		tmpObjName := dstFileName + "-rclone-move-" + random.String(8)
 		_, err := fdst.NewObject(ctx, tmpObjName)
@@ -1802,7 +1811,11 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 	} else {
 		tr := accounting.Stats(ctx).NewCheckingTransfer(srcObj)
 		if !cp {
-			err = DeleteFile(ctx, srcObj)
+			if ci.IgnoreExisting {
+				fs.Debugf(srcObj, "Not removing source file as destination file exists and --ignore-existing is set")
+			} else {
+				err = DeleteFile(ctx, srcObj)
+			}
 		}
 		tr.Done(ctx, err)
 	}

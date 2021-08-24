@@ -155,7 +155,7 @@ Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 		}, {
 			Name:     "chunk_size",
 			Advanced: false,
-			Default:  fs.SizeSuffix(2147483648), // 2GB
+			Default:  fs.SizeSuffix(2147483648), // 2 GiB
 			Help:     `Files larger than chunk size will be split in chunks.`,
 		}, {
 			Name:     "name_format",
@@ -277,12 +277,9 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 		return nil, errors.New("can't point remote at itself - check the value of the remote setting")
 	}
 
-	baseName, basePath, err := fspath.Parse(remote)
+	baseName, basePath, err := fspath.SplitFs(remote)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse remote %q to wrap", remote)
-	}
-	if baseName != "" {
-		baseName += ":"
 	}
 	// Look for a file first
 	remotePath := fspath.JoinRootPath(basePath, rpath)
@@ -1451,7 +1448,7 @@ func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
 		c.accountBytes(size)
 		return nil
 	}
-	const bufLen = 1048576 // 1MB
+	const bufLen = 1048576 // 1 MiB
 	buf := make([]byte, bufLen)
 	for size > 0 {
 		n := size

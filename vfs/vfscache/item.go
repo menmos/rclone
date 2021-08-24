@@ -29,7 +29,7 @@ import (
 //
 // - Cache.toOSPath
 // - Cache.toOSPathMeta
-// - Cache.mkdir
+// - Cache.createItemDir
 // - Cache.objectFingerprint
 // - Cache.AddVirtual
 
@@ -63,7 +63,6 @@ type Item struct {
 	downloaders     *downloaders.Downloaders // a record of the downloaders in action - may be nil
 	o               fs.Object                // object we are caching - may be nil
 	fd              *os.File                 // handle we are using to read and write to the file
-	metaDirty       bool                     // set if the info needs writeback
 	modified        bool                     // set if the file has been modified since the last Open
 	info            Info                     // info about the file to persist to backing store
 	writeBackID     writeback.Handle         // id of any writebacks in progress
@@ -170,7 +169,7 @@ func newItem(c *Cache, name string) (item *Item) {
 func (item *Item) inUse() bool {
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	return item.opens != 0 || item.metaDirty || item.info.Dirty
+	return item.opens != 0 || item.info.Dirty
 }
 
 // getATime returns the ATime of the item
@@ -208,7 +207,6 @@ func (item *Item) load() (exists bool, err error) {
 	if err != nil {
 		return true, errors.Wrap(err, "vfs cache item: corrupt metadata")
 	}
-	item.metaDirty = false
 	return true, nil
 }
 
@@ -228,7 +226,6 @@ func (item *Item) _save() (err error) {
 	if err != nil {
 		return errors.Wrap(err, "vfs cache item: failed to encode metadata")
 	}
-	item.metaDirty = false
 	return nil
 }
 
@@ -359,17 +356,22 @@ func (item *Item) Truncate(size int64) (err error) {
 	return nil
 }
 
+// _stat gets the current stat of the backing file
+//
+// Call with mutex held
+func (item *Item) _stat() (fi os.FileInfo, err error) {
+	if item.fd != nil {
+		return item.fd.Stat()
+	}
+	osPath := item.c.toOSPath(item.name) // No locking in Cache
+	return os.Stat(osPath)
+}
+
 // _getSize gets the current size of the item and updates item.info.Size
 //
 // Call with mutex held
 func (item *Item) _getSize() (size int64, err error) {
-	var fi os.FileInfo
-	if item.fd != nil {
-		fi, err = item.fd.Stat()
-	} else {
-		osPath := item.c.toOSPath(item.name) // No locking in Cache
-		fi, err = os.Stat(osPath)
-	}
+	fi, err := item._stat()
 	if err != nil {
 		if os.IsNotExist(err) && item.o != nil {
 			size = item.o.Size()
@@ -420,7 +422,6 @@ func (item *Item) Exists() bool {
 func (item *Item) _dirty() {
 	item.info.ModTime = time.Now()
 	item.info.ATime = item.info.ModTime
-	item.metaDirty = true
 	if !item.modified {
 		item.modified = true
 		item.mu.Unlock()
@@ -445,15 +446,8 @@ func (item *Item) Dirty() {
 	item.mu.Unlock()
 }
 
-// IsDirty returns true if the item is dirty
+// IsDirty returns true if the item data is dirty
 func (item *Item) IsDirty() bool {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	return item.metaDirty || item.info.Dirty
-}
-
-// IsDataDirty returns true if the item's data is dirty
-func (item *Item) IsDataDirty() bool {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 	return item.info.Dirty
@@ -517,9 +511,9 @@ func (item *Item) open(o fs.Object) (err error) {
 
 	item.info.ATime = time.Now()
 
-	osPath, err := item.c.mkdir(item.name) // No locking in Cache
+	osPath, err := item.c.createItemDir(item.name) // No locking in Cache
 	if err != nil {
-		return errors.Wrap(err, "vfs cache item: open mkdir failed")
+		return errors.Wrap(err, "vfs cache item: createItemDir failed")
 	}
 
 	err = item._checkObject(o)
@@ -605,8 +599,9 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		fs.Debugf(item.name, "vfs cache: writeback object to VFS layer")
 		// Write the object back to the VFS layer as last
 		// thing we do with mutex unlocked
+		o := item.o
 		item.mu.Unlock()
-		storeFn(item.o)
+		storeFn(o)
 		item.mu.Lock()
 	}
 	return nil
@@ -768,6 +763,9 @@ func (item *Item) reload(ctx context.Context) error {
 // check the fingerprint of an object and update the item or delete
 // the cached file accordingly
 //
+// If we have local modifications then they take precedence
+// over a change in the remote
+//
 // It ensures the file is the correct size for the object
 //
 // call with lock held
@@ -775,8 +773,12 @@ func (item *Item) _checkObject(o fs.Object) error {
 	if o == nil {
 		if item.info.Fingerprint != "" {
 			// no remote object && local object
-			// remove local object
-			item._remove("stale (remote deleted)")
+			// remove local object unless dirty
+			if !item.info.Dirty {
+				item._remove("stale (remote deleted)")
+			} else {
+				fs.Debugf(item.name, "vfs cache: remote object has gone but local object modified - keeping it")
+			}
 		} else {
 			// no remote object && no local object
 			// OK
@@ -787,14 +789,17 @@ func (item *Item) _checkObject(o fs.Object) error {
 		if item.info.Fingerprint != "" {
 			// remote object && local object
 			if remoteFingerprint != item.info.Fingerprint {
-				fs.Debugf(item.name, "vfs cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
-				item._remove("stale (remote is different)")
+				if !item.info.Dirty {
+					fs.Debugf(item.name, "vfs cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
+					item._remove("stale (remote is different)")
+				} else {
+					fs.Debugf(item.name, "vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
+				}
 			}
 		} else {
 			// remote object && no local object
 			// Set fingerprint
 			item.info.Fingerprint = remoteFingerprint
-			item.metaDirty = true
 		}
 		item.info.Size = o.Size()
 	}
@@ -857,7 +862,6 @@ func (item *Item) _remove(reason string) (wasWriting bool) {
 	wasWriting = item.c.writeback.Remove(item.writeBackID)
 	item.mu.Lock()
 	item.info.clean()
-	item.metaDirty = false
 	item._removeFile(reason)
 	item._removeMeta(reason)
 	return wasWriting
@@ -882,7 +886,7 @@ func (item *Item) RemoveNotInUse(maxAge time.Duration, emptyOnly bool) (removed 
 	spaceFreed = 0
 	removed = false
 
-	if item.opens != 0 || item.metaDirty || item.info.Dirty {
+	if item.opens != 0 || item.info.Dirty {
 		return
 	}
 
@@ -918,7 +922,7 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 	defer item.mu.Unlock()
 
 	// The item is not being used now.  Just remove it instead of resetting it.
-	if item.opens == 0 && !item.metaDirty && !item.info.Dirty {
+	if item.opens == 0 && !item.info.Dirty {
 		spaceFreed = item.info.Rs.Size()
 		if item._remove("Removing old cache file not in use") {
 			fs.Errorf(item.name, "item removed when it was writing/uploaded")
@@ -1142,7 +1146,6 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 func (item *Item) _written(offset, size int64) {
 	// defer log.Trace(item.name, "offset=%d, size=%d", offset, size)("")
 	item.info.Rs.Insert(ranges.Range{Pos: offset, Size: size})
-	item.metaDirty = true
 }
 
 // update the fingerprint of the object if any
@@ -1156,7 +1159,6 @@ func (item *Item) _updateFingerprint() {
 	item.info.Fingerprint = fs.Fingerprint(context.TODO(), item.o, false)
 	if oldFingerprint != item.info.Fingerprint {
 		fs.Debugf(item.o, "vfs cache: fingerprint now %q", item.info.Fingerprint)
-		item.metaDirty = true
 	}
 }
 
@@ -1184,6 +1186,18 @@ func (item *Item) setModTime(modTime time.Time) {
 		fs.Errorf(item.name, "vfs cache: setModTime: failed to save item info: %v", err)
 	}
 	item.mu.Unlock()
+}
+
+// GetModTime of the cache file
+func (item *Item) GetModTime() (modTime time.Time, err error) {
+	// defer log.Trace(item.name, "modTime=%v", modTime)("")
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	fi, err := item._stat()
+	if err == nil {
+		modTime = fi.ModTime()
+	}
+	return modTime, nil
 }
 
 // ReadAt bytes from the file at off
